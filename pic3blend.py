@@ -74,6 +74,24 @@ def image_files_in_dir(d):
     return sorted([os.path.join(d, n) for n in names])
 
 
+def _tmpdir_for_base(base_name):
+    """Return /tmp/iq-{basefilename}, with base_name sanitized for use in a path."""
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in base_name).strip("._") or "out"
+    safe = safe[:64]
+    return f"/tmp/iq-{safe}"
+
+
+def _read_images_from_tmpdir(tmpdir, prefix):
+    """Read images from tmpdir whose filenames start with prefix, sorted by name. Return list of BGR arrays."""
+    names = sorted(f for f in os.listdir(tmpdir) if f.startswith(prefix) and os.path.isfile(os.path.join(tmpdir, f)))
+    out = []
+    for n in names:
+        im = cv2.imread(os.path.join(tmpdir, n))
+        if im is not None:
+            out.append(im)
+    return out
+
+
 def upscale_lanczos(img, sx, sy):
     """Upscale image with Lanczos. img is (H,W,C), sx,sy scale factors."""
     h, w = img.shape[:2]
@@ -353,7 +371,7 @@ def run_enfuse_focus(input_paths, output_path):
 
 
 def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosting, mode_override, script_dir, device):
-    """Process one coll-* directory and write output TIFF."""
+    """Process one coll-* directory and write output TIFF. Intermediates go to /tmp/iq-{basefilename}."""
     files = image_files_in_dir(coll_dir)
     if not files:
         print(f"[{os.path.basename(coll_dir)}] No images, skip.")
@@ -363,49 +381,65 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
     blend_type = mode_override if mode_override else detect_blend_type(coll_dir)
     align_used = align_order[0] if align_order else "none"
 
-    # Load and upscale
+    tmpdir = _tmpdir_for_base(base_name)
+    os.makedirs(tmpdir, exist_ok=True)
+
+    # Load and upscale; write upscaled images to tmpdir to avoid I/O on (possibly network) photo dir
     tlog(f"{os.path.basename(coll_dir)}: start upscaling")
     scale_is_two = (abs(scale_x - 2.0) < 1e-6 and abs(scale_y - 2.0) < 1e-6)
     use_super_resolve = scale_is_two and model_path and os.path.isfile(model_path)
 
-    images = []
+    up_count = 0
     for f in files:
         img = cv2.imread(f)
         if img is None:
             continue
         tlog(f"{os.path.basename(coll_dir)}: upscaling {os.path.basename(f)}")
         if use_super_resolve:
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_in:
-                cv2.imwrite(tmp_in.name, img)
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_out:
-                tmp_out.close()
-                run_super_resolve(tmp_in.name, tmp_out.name, model_path, script_dir)
-                up = cv2.imread(tmp_out.name)
-                os.unlink(tmp_in.name)
-                os.unlink(tmp_out.name)
+            tmp_in = os.path.join(tmpdir, "_sr_in.png")
+            tmp_out = os.path.join(tmpdir, "_sr_out.png")
+            cv2.imwrite(tmp_in, img)
+            run_super_resolve(tmp_in, tmp_out, model_path, script_dir)
+            up = cv2.imread(tmp_out)
             if up is not None:
-                images.append(up)
+                up_path = os.path.join(tmpdir, f"up_{up_count:04d}.png")
+                cv2.imwrite(up_path, up)
+                up_count += 1
         else:
             up = upscale_lanczos(img, scale_x, scale_y)
-            images.append(up)
+            up_path = os.path.join(tmpdir, f"up_{up_count:04d}.png")
+            cv2.imwrite(up_path, up)
+            up_count += 1
 
-    if not images:
+    if up_count == 0:
         print(f"[{os.path.basename(coll_dir)}] No images loaded, skip.")
         return
 
-    # Align (all to first); warping uses GPU when available
+    images = _read_images_from_tmpdir(tmpdir, "up_")
+    if not images:
+        print(f"[{os.path.basename(coll_dir)}] No images in tmpdir, skip.")
+        return
+
+    # Align (all to first); warping uses GPU when available; write aligned to tmpdir
     tlog(f"{os.path.basename(coll_dir)}: start aligning")
     if len(align_order) > 0:
         aligned = align_images_simple(images, align_order, ref_index=0, device=device)
     else:
         aligned = images
+    for i, im in enumerate(aligned):
+        cv2.imwrite(os.path.join(tmpdir, f"al_{i:04d}.png"), im)
 
-    # Ghosting correction (separate step after alignment; uses GPU when available)
+    # Ghosting correction (separate step after alignment; read/write tmpdir)
     if ghosting and len(aligned) > 1:
         tlog(f"{os.path.basename(coll_dir)}: start ghosting")
         aligned = correct_ghosting(aligned, device=device)
+        for i, im in enumerate(aligned):
+            cv2.imwrite(os.path.join(tmpdir, f"gh_{i:04d}.png"), im)
+        aligned = _read_images_from_tmpdir(tmpdir, "gh_")
+    else:
+        aligned = _read_images_from_tmpdir(tmpdir, "al_")
 
-    # Blend (uses GPU when available for mean/min/median/max)
+    # Blend (uses GPU when available); only final output is written to coll_dir
     tlog(f"{os.path.basename(coll_dir)}: start blending")
     out_name = f"{blend_type}_{align_used}_{base_name}.tiff"
     out_path = os.path.join(coll_dir, out_name)
@@ -416,22 +450,20 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
         cv2.imwrite(out_path, out_16)
         tlog(f"{os.path.basename(coll_dir)}: wrote {out_name}")
     elif blend_type == "hdr":
-        with tempfile.TemporaryDirectory() as td:
-            paths = []
-            for i, im in enumerate(aligned):
-                p = os.path.join(td, f"hdr_{i:04d}.tif")
-                cv2.imwrite(p, im)
-                paths.append(p)
-            run_enfuse_hdr(paths, out_path)
+        paths = []
+        for i, im in enumerate(aligned):
+            p = os.path.join(tmpdir, f"enfuse_hdr_{i:04d}.tif")
+            cv2.imwrite(p, im)
+            paths.append(p)
+        run_enfuse_hdr(paths, out_path)
         tlog(f"{os.path.basename(coll_dir)}: wrote {out_name}")
     elif blend_type == "focus":
-        with tempfile.TemporaryDirectory() as td:
-            paths = []
-            for i, im in enumerate(aligned):
-                p = os.path.join(td, f"focus_{i:04d}.tif")
-                cv2.imwrite(p, im)
-                paths.append(p)
-            run_enfuse_focus(paths, out_path)
+        paths = []
+        for i, im in enumerate(aligned):
+            p = os.path.join(tmpdir, f"enfuse_focus_{i:04d}.tif")
+            cv2.imwrite(p, im)
+            paths.append(p)
+        run_enfuse_focus(paths, out_path)
         tlog(f"{os.path.basename(coll_dir)}: wrote {out_name}")
 
     print(f"[{os.path.basename(coll_dir)}] -> {out_name}")
