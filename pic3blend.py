@@ -306,13 +306,17 @@ def align_images_simple(images, method_order, ref_index, device):
             result.append(images[i])
             continue
         if use_gpu and transform is not None:
-            h, w = ref.shape[:2]
-            img_t = _numpy_to_tensor(images[i], device)
-            if transform_type == "homography":
-                warped = _warp_perspective_gpu(img_t, transform, h, w, device)
-            else:
-                warped = _warp_affine_gpu(img_t, transform, h, w, device)
-            aligned_np = _tensor_to_numpy(warped)
+            try:
+                h, w = ref.shape[:2]
+                img_t = _numpy_to_tensor(images[i], device)
+                if transform_type == "homography":
+                    warped = _warp_perspective_gpu(img_t, transform, h, w, device)
+                else:
+                    warped = _warp_affine_gpu(img_t, transform, h, w, device)
+                # keep dtype of original image when coming back
+                aligned_np = _tensor_to_numpy(warped, dtype=images[i].dtype)
+            except Exception as e:
+                tlog(f"GPU warp failed, using CPU alignment for image {i}: {e}")
         result.append(aligned_np)
     return result
 
@@ -345,30 +349,34 @@ def correct_ghosting(images, variance_percentile=95.0, device=None):
         device = get_device()
     use_gpu = device.type in ("cuda", "mps")
     if use_gpu:
-        # (N, C, H, W) on device, float [0,1]
-        tensors = [_numpy_to_tensor(im, device) for im in images]
-        stack = torch.stack(tensors, dim=0)
-        var = stack.var(dim=0)  # (C, H, W)
-        var_pixel, _ = var.max(dim=0)  # (H, W)
-        q = variance_percentile / 100.0
         try:
-            thresh = torch.quantile(var_pixel.flatten(), q).item()
-        except Exception:
-            thresh = float(np.percentile(var_pixel.cpu().numpy(), variance_percentile))
-        ghost_mask_2d = var_pixel > thresh  # (H, W)
-        ghost_mask = ghost_mask_2d.unsqueeze(0).expand(stack.shape[1], -1, -1)  # (C, H, W)
-        med = stack.median(dim=0).values
-        out = []
-        for i in range(len(images)):
-            img = stack[i].clone()
-            img[ghost_mask] = med[ghost_mask]
-            img = img.clamp(0, 1)
-            dtype = images[i].dtype
-            if dtype == np.uint16:
-                out.append(_tensor_to_numpy(img, dtype=np.uint16))
-            else:
-                out.append(_tensor_to_numpy(img, dtype=np.uint8))
-        return out
+            # (N, C, H, W) on device, float [0,1]
+            tensors = [_numpy_to_tensor(im, device) for im in images]
+            stack = torch.stack(tensors, dim=0)
+            var = stack.var(dim=0)  # (C, H, W)
+            var_pixel, _ = var.max(dim=0)  # (H, W)
+            q = variance_percentile / 100.0
+            try:
+                thresh = torch.quantile(var_pixel.flatten(), q).item()
+            except Exception:
+                # Fallback to NumPy percentile on CPU if torch.quantile is unsupported
+                thresh = float(np.percentile(var_pixel.cpu().numpy(), variance_percentile))
+            ghost_mask_2d = var_pixel > thresh  # (H, W)
+            ghost_mask = ghost_mask_2d.unsqueeze(0).expand(stack.shape[1], -1, -1)  # (C, H, W)
+            med = stack.median(dim=0).values
+            out = []
+            for i in range(len(images)):
+                img = stack[i].clone()
+                img[ghost_mask] = med[ghost_mask]
+                img = img.clamp(0, 1)
+                dtype = images[i].dtype
+                if dtype == np.uint16:
+                    out.append(_tensor_to_numpy(img, dtype=np.uint16))
+                else:
+                    out.append(_tensor_to_numpy(img, dtype=np.uint8))
+            return out
+        except Exception as e:
+            tlog(f"GPU ghosting failed, falling back to CPU: {e}")
     # CPU path
     stack = np.array(images, dtype=np.float64)
     var = np.var(stack, axis=0)
@@ -391,20 +399,23 @@ def _stack_blend(images, kind="mean", device=None):
         device = get_device()
     use_gpu = device.type in ("cuda", "mps")
     if use_gpu:
-        tensors = [_numpy_to_tensor(im, device) for im in images]
-        stack = torch.stack(tensors, dim=0)
-        if kind == "mean":
-            out = stack.mean(dim=0)
-        elif kind == "min":
-            out = stack.min(dim=0).values
-        elif kind == "median":
-            out = stack.median(dim=0).values
-        elif kind == "max":
-            out = stack.max(dim=0).values
-        else:
-            out = stack.mean(dim=0)
-        out = out.clamp(0, 1)
-        return out.cpu().numpy().transpose(1, 2, 0)  # CHW -> HWC in [0,1]
+        try:
+            tensors = [_numpy_to_tensor(im, device) for im in images]
+            stack = torch.stack(tensors, dim=0)
+            if kind == "mean":
+                out = stack.mean(dim=0)
+            elif kind == "min":
+                out = stack.min(dim=0).values
+            elif kind == "median":
+                out = stack.median(dim=0).values
+            elif kind == "max":
+                out = stack.max(dim=0).values
+            else:
+                out = stack.mean(dim=0)
+            out = out.clamp(0, 1)
+            return out.cpu().numpy().transpose(1, 2, 0)  # CHW -> HWC in [0,1]
+        except Exception as e:
+            tlog(f"GPU blend '{kind}' failed, falling back to CPU: {e}")
     # CPU path: normalize by bit depth, operate in [0,1]
     stack_np = np.stack(images, axis=0)
     if stack_np.dtype == np.uint16:
