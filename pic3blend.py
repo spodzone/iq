@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from concurrent.futures import ThreadPoolExecutor
+import shutil
 
 # Common image extensions (OpenCV imread)
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"}
@@ -173,6 +174,29 @@ def _to_u16(img):
     if np.issubdtype(img.dtype, np.floating):
         return (np.clip(img, 0.0, 1.0) * 65535.0 + 0.5).astype(np.uint16)
     return img.astype(np.uint16)
+
+
+def _copy_exif_from_base(base_path, target_path):
+    """Copy EXIF from base image into target using exiftool, if available."""
+    try:
+        # exiftool -overwrite_original -TagsFromFile base -all:all target
+        subprocess.run(
+            [
+                "exiftool",
+                "-overwrite_original",
+                "-TagsFromFile",
+                base_path,
+                "-all:all",
+                target_path,
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        tlog("exiftool not found, skipping EXIF copy")
+    except Exception as e:
+        tlog(f"exiftool failed for {os.path.basename(target_path)}: {e}")
 
 
 def upscale_lanczos(img, sx, sy):
@@ -528,6 +552,7 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
     images = _read_images_from_tmpdir(tmpdir, "up_")
     if not images:
         print(f"[{os.path.basename(coll_dir)}] No images in tmpdir, skip.")
+        shutil.rmtree(tmpdir, ignore_errors=True)
         return
 
     # Align (all to first); warping uses GPU when available; write aligned to tmpdir
@@ -549,34 +574,40 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
     else:
         aligned = _read_images_from_tmpdir(tmpdir, "al_")
 
-    # Blend (uses GPU when available); only final output is written to coll_dir
+    # Blend (uses GPU when available); final output first goes to tmpdir, then is copied to coll_dir
     tlog(f"{os.path.basename(coll_dir)}: start blending")
     out_name = f"{blend_type}_{align_used}_{base_name}.tiff"
-    out_path = os.path.join(coll_dir, out_name)
+    tmp_out_path = os.path.join(tmpdir, out_name)
+    final_out_path = os.path.join(coll_dir, out_name)
 
     if blend_type in ("mean", "min", "median", "max"):
         out_float = _stack_blend(aligned, kind=blend_type, device=device)
         out_16 = float_to_16bit_tiff(out_float)
-        cv2.imwrite(out_path, out_16)
-        tlog(f"{os.path.basename(coll_dir)}: wrote {out_name}")
+        cv2.imwrite(tmp_out_path, out_16)
     elif blend_type == "hdr":
         paths = []
         for i, im in enumerate(aligned):
             p = os.path.join(tmpdir, f"enfuse_hdr_{i:04d}.tif")
             cv2.imwrite(p, _to_u16(im))
             paths.append(p)
-        run_enfuse_hdr(paths, out_path)
-        tlog(f"{os.path.basename(coll_dir)}: wrote {out_name}")
+        run_enfuse_hdr(paths, tmp_out_path)
     elif blend_type == "focus":
         paths = []
         for i, im in enumerate(aligned):
             p = os.path.join(tmpdir, f"enfuse_focus_{i:04d}.tif")
             cv2.imwrite(p, _to_u16(im))
             paths.append(p)
-        run_enfuse_focus(paths, out_path)
-        tlog(f"{os.path.basename(coll_dir)}: wrote {out_name}")
+        run_enfuse_focus(paths, tmp_out_path)
 
-    print(f"[{os.path.basename(coll_dir)}] -> {out_name}")
+    # Copy EXIF from base into tmp result, then copy final result into the real output directory
+    try:
+        _copy_exif_from_base(base_path, tmp_out_path)
+        shutil.copy2(tmp_out_path, final_out_path)
+        tlog(f"{os.path.basename(coll_dir)}: wrote {out_name}")
+        print(f"[{os.path.basename(coll_dir)}] -> {out_name}")
+    finally:
+        # Clean up temporary directory for this collection
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def main():
