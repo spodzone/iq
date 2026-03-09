@@ -2,5 +2,6 @@
 opencv-python>=4.5.0
 numpy>=1.19.0
 torch>=1.9.0
+Pillow>=9.0.0
 
 # Optional: enfuse (system binary) for --mode hdr and --mode focus

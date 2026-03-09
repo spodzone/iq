@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 
 # Common image extensions (OpenCV imread)
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"}
@@ -39,20 +40,26 @@ def get_device():
 
 
 def _numpy_to_tensor(img_bgr, device, batch=False):
-    """HWC uint8 BGR -> CHW float32 [0,1] on device; optional batch dim."""
-    x = torch.from_numpy(img_bgr).to(device=device, dtype=torch.float32).div_(255.0)
+    """HWC uint8/uint16 BGR -> CHW float32 [0,1] on device; optional batch dim."""
+    x = torch.from_numpy(img_bgr).to(device=device, dtype=torch.float32)
+    if img_bgr.dtype == np.uint16:
+        x = x.div_(65535.0)
+    else:
+        x = x.div_(255.0)
     x = x.permute(2, 0, 1)  # HWC -> CHW
     if batch:
         x = x.unsqueeze(0)
     return x
 
 
-def _tensor_to_numpy(x):
-    """CHW or NCHW float [0,1] -> HWC uint8 BGR."""
+def _tensor_to_numpy(x, dtype=np.uint8):
+    """CHW or NCHW float [0,1] -> HWC BGR with requested dtype (uint8/uint16)."""
     if x.dim() == 4:
         x = x.squeeze(0)
-    x = x.permute(1, 2, 0).clamp(0, 1).mul(255).round().byte().cpu().numpy()
-    return x
+    x = x.permute(1, 2, 0).clamp(0, 1).cpu().numpy()
+    if dtype == np.uint16:
+        return (x * 65535.0 + 0.5).astype(np.uint16)
+    return (x * 255.0 + 0.5).astype(np.uint8)
 
 
 def parse_scale(s):
@@ -72,6 +79,42 @@ def image_files_in_dir(d):
         if os.path.isfile(os.path.join(d, f)) and os.path.splitext(f)[1].lower() in IMAGE_EXT
     ]
     return sorted([os.path.join(d, n) for n in names])
+
+
+def load_image(path):
+    """Robust image loader: try OpenCV first, then Pillow as fallback.
+
+    Returns uint8 or uint16 BGR numpy array or None on failure.
+    """
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is not None:
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        return img
+
+    # Fallback: Pillow can often read TIFFs OpenCV cannot
+    try:
+        with Image.open(path) as im:
+            # Preserve 16-bit where possible
+            if im.mode in ("I;16", "I;16B", "I;16L"):
+                im = im.convert("I;16")
+                arr = np.array(im)  # (H,W) uint16
+                if arr.ndim == 2:
+                    arr = np.stack([arr] * 3, axis=-1)
+                return arr
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGB")
+            arr = np.array(im)
+            if arr.ndim == 2:
+                arr = np.stack([arr] * 3, axis=-1)
+            # Convert RGB(A) -> BGR
+            if arr.shape[2] == 4:
+                arr = arr[:, :, :3]
+            arr = arr[:, :, ::-1].copy()
+            return arr.astype(arr.dtype)
+    except Exception as e:
+        tlog(f"load_image failed for {path}: {e}")
+        return None
 
 
 def _tmpdir_for_base(base_name):
@@ -291,7 +334,11 @@ def correct_ghosting(images, variance_percentile=95.0, device=None):
             img = stack[i].clone()
             img[ghost_mask] = med[ghost_mask]
             img = img.clamp(0, 1)
-            out.append(_tensor_to_numpy(img))
+            dtype = images[i].dtype
+            if dtype == np.uint16:
+                out.append(_tensor_to_numpy(img, dtype=np.uint16))
+            else:
+                out.append(_tensor_to_numpy(img, dtype=np.uint8))
         return out
     # CPU path
     stack = np.array(images, dtype=np.float64)
@@ -310,7 +357,7 @@ def correct_ghosting(images, variance_percentile=95.0, device=None):
 
 
 def _stack_blend(images, kind="mean", device=None):
-    """kind: mean, min, median, max. Uses GPU when device is cuda/mps. Returns float array 0-255."""
+    """kind: mean, min, median, max. Uses GPU when device is cuda/mps. Returns float array in [0,1]."""
     if device is None:
         device = get_device()
     use_gpu = device.type in ("cuda", "mps")
@@ -327,9 +374,14 @@ def _stack_blend(images, kind="mean", device=None):
             out = stack.max(dim=0).values
         else:
             out = stack.mean(dim=0)
-        out = out.clamp(0, 1).mul(255)
-        return out.cpu().numpy().transpose(1, 2, 0)  # CHW -> HWC
-    stack = np.array(images, dtype=np.float64)
+        out = out.clamp(0, 1)
+        return out.cpu().numpy().transpose(1, 2, 0)  # CHW -> HWC in [0,1]
+    # CPU path: normalize by bit depth, operate in [0,1]
+    stack_np = np.stack(images, axis=0)
+    if stack_np.dtype == np.uint16:
+        stack = stack_np.astype(np.float64) / 65535.0
+    else:
+        stack = stack_np.astype(np.float64) / 255.0
     if kind == "mean":
         out = np.mean(stack, axis=0)
     elif kind == "min":
@@ -340,12 +392,12 @@ def _stack_blend(images, kind="mean", device=None):
         out = np.max(stack, axis=0)
     else:
         out = np.mean(stack, axis=0)
-    return np.clip(out, 0, 255)
+    return np.clip(out, 0.0, 1.0)
 
 
 def float_to_16bit_tiff(arr):
-    """Convert 0-255 float array to 16-bit for TIFF (0-65535)."""
-    return (np.clip(arr, 0, 255) * (65535 / 255)).astype(np.uint16)
+    """Convert [0,1] float array to 16-bit for TIFF (0-65535)."""
+    return (np.clip(arr, 0.0, 1.0) * 65535.0 + 0.5).astype(np.uint16)
 
 
 def run_enfuse_hdr(input_paths, output_path):
@@ -391,8 +443,9 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
 
     up_count = 0
     for f in files:
-        img = cv2.imread(f)
+        img = load_image(f)
         if img is None:
+            tlog(f"{os.path.basename(coll_dir)}: warning: could not read {os.path.basename(f)}")
             continue
         tlog(f"{os.path.basename(coll_dir)}: upscaling {os.path.basename(f)}")
         if use_super_resolve:
