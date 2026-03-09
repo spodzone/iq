@@ -477,18 +477,22 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
             return
         tlog(f"{os.path.basename(coll_dir)}: upscaling {os.path.basename(path)}")
         if use_super_resolve:
-            # super-resolve.py currently operates in 8-bit; its output will be
-            # up-converted when writing the final 16-bit TIFF.
+            # super-resolve.py currently operates in 8-bit; immediately expand
+            # its output back to 16-bit for all downstream processing.
             tmp_in = os.path.join(tmpdir, f"_sr_in_{idx:04d}.tif")
             tmp_out = os.path.join(tmpdir, f"_sr_out_{idx:04d}.tif")
             cv2.imwrite(tmp_in, img)
             run_super_resolve(tmp_in, tmp_out, model_path, script_dir)
             up = load_image(tmp_out)
             if up is not None:
+                if up.dtype == np.uint8:
+                    up = (up.astype(np.uint16) * 257)  # 0-255 -> full 0-65535 ladder
                 up_path = os.path.join(tmpdir, f"up_{idx:04d}.tif")
                 cv2.imwrite(up_path, up)
         else:
             up = upscale_lanczos(img, scale_x, scale_y)
+            if up.dtype == np.uint8:
+                up = (up.astype(np.uint16) * 257)
             up_path = os.path.join(tmpdir, f"up_{idx:04d}.tif")
             cv2.imwrite(up_path, up)
 
