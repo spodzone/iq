@@ -19,6 +19,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+
+# Allow large images (e.g. upscaled 16-bit TIFFs); we're loading our own files, not untrusted input.
+Image.MAX_IMAGE_PIXELS = None
+
 from concurrent.futures import ThreadPoolExecutor
 import shutil
 
