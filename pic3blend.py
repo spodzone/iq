@@ -532,8 +532,8 @@ def main():
                     help="Path to super-resolve model; used only when scale is 2")
     ap.add_argument("--align", type=str, default="akaze,ecc",
                     help="Alignment methods to try, comma-separated (e.g. akaze,ecc)")
-    ap.add_argument("--ghosting", type=int, default=0, choices=[0, 1],
-                    help="1 = run ghosting detection/correction after alignment (high-variance pixels replaced with median)")
+    ap.add_argument("--ghosting", type=int, default=1, choices=[0, 1],
+                    help="Enable(1)/disable(0) ghosting detection/correction after alignment (default 1)")
     ap.add_argument("--mode", type=str, default=None, dest="mode_override",
                     choices=["mean", "hdr", "focus", "min", "median", "max"],
                     help="Override blend mode (otherwise inferred from directory name)")
