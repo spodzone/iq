@@ -164,6 +164,17 @@ def _read_images_from_tmpdir(tmpdir, prefix):
     return out
 
 
+def _to_u16(img):
+    """Ensure an image is uint16, preserving as much precision as possible."""
+    if img.dtype == np.uint16:
+        return img
+    if img.dtype == np.uint8:
+        return (img.astype(np.uint16) * 257)
+    if np.issubdtype(img.dtype, np.floating):
+        return (np.clip(img, 0.0, 1.0) * 65535.0 + 0.5).astype(np.uint16)
+    return img.astype(np.uint16)
+
+
 def upscale_lanczos(img, sx, sy):
     """Upscale image with Lanczos. img is (H,W,C), sx,sy scale factors."""
     h, w = img.shape[:2]
@@ -377,8 +388,9 @@ def correct_ghosting(images, variance_percentile=95.0, device=None):
             return out
         except Exception as e:
             tlog(f"GPU ghosting failed, falling back to CPU: {e}")
-    # CPU path
-    stack = np.array(images, dtype=np.float64)
+    # CPU path – preserve original bit depth
+    dtype = images[0].dtype
+    stack = np.stack(images, axis=0).astype(np.float64)
     var = np.var(stack, axis=0)
     var_pixel = np.max(var, axis=-1)
     thresh = np.percentile(var_pixel, variance_percentile)
@@ -386,10 +398,12 @@ def correct_ghosting(images, variance_percentile=95.0, device=None):
     ghost_mask = np.broadcast_to(ghost_mask_2d[:, :, np.newaxis], stack.shape[1:])
     med = np.median(stack, axis=0)
     out = []
+    maxv = 65535.0 if dtype == np.uint16 else 255.0
     for i in range(len(images)):
         img = stack[i].copy()
         img[ghost_mask] = med[ghost_mask]
-        out.append(np.clip(img, 0, 255).astype(np.uint8))
+        img = np.clip(img, 0.0, maxv)
+        out.append(img.astype(dtype))
     return out
 
 
@@ -523,14 +537,14 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
     else:
         aligned = images
     for i, im in enumerate(aligned):
-        cv2.imwrite(os.path.join(tmpdir, f"al_{i:04d}.tif"), im)
+        cv2.imwrite(os.path.join(tmpdir, f"al_{i:04d}.tif"), _to_u16(im))
 
     # Ghosting correction (separate step after alignment; read/write tmpdir)
     if ghosting and len(aligned) > 1:
         tlog(f"{os.path.basename(coll_dir)}: start ghosting")
         aligned = correct_ghosting(aligned, device=device)
         for i, im in enumerate(aligned):
-            cv2.imwrite(os.path.join(tmpdir, f"gh_{i:04d}.tif"), im)
+            cv2.imwrite(os.path.join(tmpdir, f"gh_{i:04d}.tif"), _to_u16(im))
         aligned = _read_images_from_tmpdir(tmpdir, "gh_")
     else:
         aligned = _read_images_from_tmpdir(tmpdir, "al_")
@@ -549,7 +563,7 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
         paths = []
         for i, im in enumerate(aligned):
             p = os.path.join(tmpdir, f"enfuse_hdr_{i:04d}.tif")
-            cv2.imwrite(p, im)
+            cv2.imwrite(p, _to_u16(im))
             paths.append(p)
         run_enfuse_hdr(paths, out_path)
         tlog(f"{os.path.basename(coll_dir)}: wrote {out_name}")
@@ -557,7 +571,7 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
         paths = []
         for i, im in enumerate(aligned):
             p = os.path.join(tmpdir, f"enfuse_focus_{i:04d}.tif")
-            cv2.imwrite(p, im)
+            cv2.imwrite(p, _to_u16(im))
             paths.append(p)
         run_enfuse_focus(paths, out_path)
         tlog(f"{os.path.basename(coll_dir)}: wrote {out_name}")
