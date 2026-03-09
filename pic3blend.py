@@ -19,6 +19,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from concurrent.futures import ThreadPoolExecutor
 
 # Common image extensions (OpenCV imread)
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"}
@@ -450,7 +451,7 @@ def run_enfuse_focus(input_paths, output_path):
     subprocess.run(cmd, check=True)
 
 
-def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosting, mode_override, script_dir, device):
+def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosting, mode_override, script_dir, device, threads):
     """Process one coll-* directory and write output TIFF. Intermediates go to /tmp/iq-{basefilename}."""
     files = image_files_in_dir(coll_dir)
     if not files:
@@ -469,34 +470,31 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
     scale_is_two = (abs(scale_x - 2.0) < 1e-6 and abs(scale_y - 2.0) < 1e-6)
     use_super_resolve = scale_is_two and model_path and os.path.isfile(model_path)
 
-    up_count = 0
-    for f in files:
-        img = load_image(f)
+    def _upscale_one(idx, path):
+        img = load_image(path)
         if img is None:
-            tlog(f"{os.path.basename(coll_dir)}: warning: could not read {os.path.basename(f)}")
-            continue
-        tlog(f"{os.path.basename(coll_dir)}: upscaling {os.path.basename(f)}")
+            tlog(f"{os.path.basename(coll_dir)}: warning: could not read {os.path.basename(path)}")
+            return
+        tlog(f"{os.path.basename(coll_dir)}: upscaling {os.path.basename(path)}")
         if use_super_resolve:
             # super-resolve.py currently operates in 8-bit; its output will be
             # up-converted when writing the final 16-bit TIFF.
-            tmp_in = os.path.join(tmpdir, "_sr_in.tif")
-            tmp_out = os.path.join(tmpdir, "_sr_out.tif")
+            tmp_in = os.path.join(tmpdir, f"_sr_in_{idx:04d}.tif")
+            tmp_out = os.path.join(tmpdir, f"_sr_out_{idx:04d}.tif")
             cv2.imwrite(tmp_in, img)
             run_super_resolve(tmp_in, tmp_out, model_path, script_dir)
             up = load_image(tmp_out)
             if up is not None:
-                up_path = os.path.join(tmpdir, f"up_{up_count:04d}.tif")
+                up_path = os.path.join(tmpdir, f"up_{idx:04d}.tif")
                 cv2.imwrite(up_path, up)
-                up_count += 1
         else:
             up = upscale_lanczos(img, scale_x, scale_y)
-            up_path = os.path.join(tmpdir, f"up_{up_count:04d}.tif")
+            up_path = os.path.join(tmpdir, f"up_{idx:04d}.tif")
             cv2.imwrite(up_path, up)
-            up_count += 1
 
-    if up_count == 0:
-        print(f"[{os.path.basename(coll_dir)}] No images loaded, skip.")
-        return
+    with ThreadPoolExecutor(max_workers=max(1, threads)) as ex:
+        for idx, f in enumerate(files):
+            ex.submit(_upscale_one, idx, f)
 
     images = _read_images_from_tmpdir(tmpdir, "up_")
     if not images:
@@ -567,6 +565,8 @@ def main():
     ap.add_argument("--mode", type=str, default=None, dest="mode_override",
                     choices=["mean", "hdr", "focus", "min", "median", "max"],
                     help="Override blend mode (otherwise inferred from directory name)")
+    ap.add_argument("--threads", type=int, default=3,
+                    help="Number of threads for the upscaling phase (default 3)")
     args = ap.parse_args()
 
     scale_x, scale_y = parse_scale(args.scale)
@@ -579,7 +579,8 @@ def main():
         coll_dirs = sorted(glob.glob("coll-*"))
     for d in coll_dirs:
         if os.path.isdir(d):
-            process_coll_dir(d, scale_x, scale_y, args.model, align_order, args.ghosting == 1, args.mode_override, script_dir, device)
+            process_coll_dir(d, scale_x, scale_y, args.model, align_order, args.ghosting == 1,
+                             args.mode_override, script_dir, device, args.threads)
 
 
 if __name__ == "__main__":
