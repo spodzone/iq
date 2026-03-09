@@ -82,17 +82,45 @@ def image_files_in_dir(d):
 
 
 def load_image(path):
-    """Robust image loader: try OpenCV first, then Pillow as fallback.
+    """Robust image loader with 16-bit preference.
+
+    For TIFF (`.tif`/`.tiff`), use Pillow first to avoid OpenCV TIFF bugs and to
+    preserve 16-bit data. For other formats, try OpenCV first, then Pillow.
 
     Returns uint8 or uint16 BGR numpy array or None on failure.
     """
+    ext = os.path.splitext(path)[1].lower()
+    # For TIFFs, go straight to Pillow to dodge OpenCV's TIFFReadDirectory issues.
+    if ext in (".tif", ".tiff"):
+        try:
+            with Image.open(path) as im:
+                if im.mode in ("I;16", "I;16B", "I;16L"):
+                    im = im.convert("I;16")
+                    arr = np.array(im)  # (H,W) uint16
+                    if arr.ndim == 2:
+                        arr = np.stack([arr] * 3, axis=-1)
+                    return arr
+                if im.mode not in ("RGB", "RGBA"):
+                    im = im.convert("RGB")
+                arr = np.array(im)
+                if arr.ndim == 2:
+                    arr = np.stack([arr] * 3, axis=-1)
+                if arr.shape[2] == 4:
+                    arr = arr[:, :, :3]
+                arr = arr[:, :, ::-1].copy()
+                return arr.astype(arr.dtype)
+        except Exception as e:
+            tlog(f"load_image (TIFF) failed for {path}: {e}")
+            return None
+
+    # Non-TIFF: OpenCV first, then Pillow
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is not None:
         if img.ndim == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         return img
 
-    # Fallback: Pillow can often read TIFFs OpenCV cannot
+    # Fallback: Pillow can often read formats OpenCV cannot
     try:
         with Image.open(path) as im:
             # Preserve 16-bit where possible
@@ -129,7 +157,7 @@ def _read_images_from_tmpdir(tmpdir, prefix):
     names = sorted(f for f in os.listdir(tmpdir) if f.startswith(prefix) and os.path.isfile(os.path.join(tmpdir, f)))
     out = []
     for n in names:
-        im = cv2.imread(os.path.join(tmpdir, n))
+        im = load_image(os.path.join(tmpdir, n))
         if im is not None:
             out.append(im)
     return out
@@ -449,18 +477,20 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
             continue
         tlog(f"{os.path.basename(coll_dir)}: upscaling {os.path.basename(f)}")
         if use_super_resolve:
-            tmp_in = os.path.join(tmpdir, "_sr_in.png")
-            tmp_out = os.path.join(tmpdir, "_sr_out.png")
+            # super-resolve.py currently operates in 8-bit; its output will be
+            # up-converted when writing the final 16-bit TIFF.
+            tmp_in = os.path.join(tmpdir, "_sr_in.tif")
+            tmp_out = os.path.join(tmpdir, "_sr_out.tif")
             cv2.imwrite(tmp_in, img)
             run_super_resolve(tmp_in, tmp_out, model_path, script_dir)
-            up = cv2.imread(tmp_out)
+            up = load_image(tmp_out)
             if up is not None:
-                up_path = os.path.join(tmpdir, f"up_{up_count:04d}.png")
+                up_path = os.path.join(tmpdir, f"up_{up_count:04d}.tif")
                 cv2.imwrite(up_path, up)
                 up_count += 1
         else:
             up = upscale_lanczos(img, scale_x, scale_y)
-            up_path = os.path.join(tmpdir, f"up_{up_count:04d}.png")
+            up_path = os.path.join(tmpdir, f"up_{up_count:04d}.tif")
             cv2.imwrite(up_path, up)
             up_count += 1
 
@@ -480,14 +510,14 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
     else:
         aligned = images
     for i, im in enumerate(aligned):
-        cv2.imwrite(os.path.join(tmpdir, f"al_{i:04d}.png"), im)
+        cv2.imwrite(os.path.join(tmpdir, f"al_{i:04d}.tif"), im)
 
     # Ghosting correction (separate step after alignment; read/write tmpdir)
     if ghosting and len(aligned) > 1:
         tlog(f"{os.path.basename(coll_dir)}: start ghosting")
         aligned = correct_ghosting(aligned, device=device)
         for i, im in enumerate(aligned):
-            cv2.imwrite(os.path.join(tmpdir, f"gh_{i:04d}.png"), im)
+            cv2.imwrite(os.path.join(tmpdir, f"gh_{i:04d}.tif"), im)
         aligned = _read_images_from_tmpdir(tmpdir, "gh_")
     else:
         aligned = _read_images_from_tmpdir(tmpdir, "al_")
