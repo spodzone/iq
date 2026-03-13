@@ -110,101 +110,83 @@ def extract_windows(img, ws):
 # ==========================================
 
 def train_mode(args):
-    print(f"Training on {len(args.files)} images.")
-    
+    filepath = args.file
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(filepath)
+    print(f"Training on single image: {os.path.basename(filepath)}")
+
     model = ArtifactRemovalNet().to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     criterion = nn.L1Loss()
     scaler = GradScaler('cuda')
-    
+
     if os.path.exists(args.model_output):
         print(f"Resuming from {args.model_output}")
         ckpt = torch.load(args.model_output)
         model.load_state_dict(ckpt['model_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        if 'scaler' in ckpt: scaler.load_state_dict(ckpt['scaler'])
+        if 'scaler' in ckpt:
+            scaler.load_state_dict(ckpt['scaler'])
 
     model.train()
-    
-    # State variables
+
+    gt = cv2.imread(filepath)
+    if gt is None:
+        raise RuntimeError(f"Could not read image: {filepath}")
+
+    tgt = cv2.resize(gt, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_LANCZOS4)
+    qrt = cv2.resize(gt, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_LANCZOS4)
+    qrt_f = qrt.astype(np.float32) / 255.0
+    qrt_f = add_chroma_noise(qrt_f, args.noise_freq, args.noise_amount)
+    qrt_n = (qrt_f * 255.0).astype(np.uint8)
+    h_tgt, w_tgt = tgt.shape[:2]
+    inp = cv2.resize(qrt_n, (w_tgt, h_tgt), interpolation=cv2.INTER_LANCZOS4)
+
+    inp_patches = extract_windows(inp, args.window_size)
+    tgt_patches = extract_windows(tgt, args.window_size)
+    n_patches = len(inp_patches)
+    batches_per_epoch = (n_patches + args.batch_size - 1) // args.batch_size
+
     iteration_counter = 0
     loss_history = deque(maxlen=10)
     max_iter = args.max_iterations if args.max_iterations > 0 else float('inf')
     start_time = time.time()
-    
-    print(f"Config: Min {args.min_iterations} | Max {max_iter} | Stop {args.stop}% | Window {args.window_size}")
-    
-    file_cycle = iter(args.files)
-    
+
+    print(f"Config: {n_patches} windows, {batches_per_epoch} batches/epoch | Min {args.min_iterations} | Max {max_iter} | Stop {args.stop}% | Window {args.window_size}")
+
+    epoch = 0
     while True:
-        # 1. Check Hard Limits
-        if iteration_counter >= max_iter:
-            print(f"\nMax iterations reached.")
-            break
-            
-        # 2. Get next file
-        try:
-            filepath = next(file_cycle)
-        except StopIteration:
-            if iteration_counter < args.min_iterations:
-                print("\nDataset exhausted, restarting cycle...")
-                file_cycle = iter(args.files)
-                filepath = next(file_cycle)
-            else:
-                print("\nDataset exhausted.")
+        indices = np.arange(n_patches)
+        np.random.shuffle(indices)
+        inp_perm = [inp_patches[i] for i in indices]
+        tgt_perm = [tgt_patches[i] for i in indices]
+
+        pbar = tqdm(range(0, n_patches, args.batch_size), desc=f"Epoch {epoch}", leave=False,
+                    bar_format='{desc} {bar} {postfix}')
+        epoch_losses = []
+
+        for i in pbar:
+            if iteration_counter >= max_iter:
                 break
-        
-        if not os.path.exists(filepath):
-            continue
-        
-        # Print filename cleanly before the progress bar
-        tqdm.write(f"File: {os.path.basename(filepath)}")
-            
-        # 3. Process ENTIRE file
-        gt = cv2.imread(filepath)
-        if gt is None: continue
-        
-        tgt = cv2.resize(gt, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_LANCZOS4)
-        qrt = cv2.resize(gt, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_LANCZOS4)
-        
-        qrt_f = qrt.astype(np.float32)/255.0
-        qrt_f = add_chroma_noise(qrt_f, args.noise_freq, args.noise_amount)
-        qrt_n = (qrt_f*255.0).astype(np.uint8)
-        
-        h_tgt, w_tgt = tgt.shape[:2]
-        inp = cv2.resize(qrt_n, (w_tgt, h_tgt), interpolation=cv2.INTER_LANCZOS4)
-        
-        inp_patches = extract_windows(inp, args.window_size)
-        tgt_patches = extract_windows(tgt, args.window_size)
-        
-        # 4. Train on windows
-        pbar_file = tqdm(range(0, len(inp_patches), args.batch_size), 
-                         desc="Iter -----", 
-                         leave=False, 
-                         bar_format='{desc} {bar} {postfix}')
-        
-        for i in pbar_file:
-            batch_inp = inp_patches[i:i+args.batch_size]
-            batch_tgt = tgt_patches[i:i+args.batch_size]
-            
-            batch_inp_t = torch.from_numpy(np.stack([p.astype(np.float32)/255.0 for p in batch_inp])).permute(0,3,1,2).to(device)
-            batch_tgt_t = torch.from_numpy(np.stack([p.astype(np.float32)/255.0 for p in batch_tgt])).permute(0,3,1,2).to(device)
-            
+            batch_inp = inp_perm[i:i + args.batch_size]
+            batch_tgt = tgt_perm[i:i + args.batch_size]
+
+            batch_inp_t = torch.from_numpy(np.stack([p.astype(np.float32) / 255.0 for p in batch_inp])).permute(0, 3, 1, 2).to(device)
+            batch_tgt_t = torch.from_numpy(np.stack([p.astype(np.float32) / 255.0 for p in batch_tgt])).permute(0, 3, 1, 2).to(device)
+
             optimizer.zero_grad()
-            
             with autocast('cuda'):
                 res = model(batch_inp_t)
                 loss = criterion(res, batch_tgt_t - batch_inp_t)
-                
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            
+
             current_loss = loss.item()
             loss_history.append(current_loss)
+            epoch_losses.append(current_loss)
             iteration_counter += 1
-            
-            # Stats
+
             stop_pct_val = 0.0
             if len(loss_history) >= 10:
                 hist = list(loss_history)
@@ -212,45 +194,36 @@ def train_mode(args):
                 avg_recent = sum(hist[5:]) / 5.0
                 if avg_prev > 1e-9:
                     stop_pct_val = abs(avg_recent - avg_prev) / avg_prev * 100.0
-
             elapsed = time.time() - start_time
             speed = iteration_counter / elapsed if elapsed > 0 else 0
+            pbar.set_postfix_str(f"Loss {current_loss:.5f} | Stop {stop_pct_val:.2f}% | {speed:.1f} it/s")
 
-            # Fixed width formatting
-            # Iter: 5 chars
-            # Loss: 8 chars (0.00000)
-            # Stop: 6 chars (100.00)
-            # Speed: 6 chars (1000.0)
-            iter_str = f"Iter {iteration_counter:5d}"
-            loss_str = f"{current_loss:8.5f}"
-            stop_str = f"{stop_pct_val:6.2f}"
-            speed_str = f"{speed:6.1f}"
-
-            pbar_file.set_description(iter_str)
-            pbar_file.set_postfix_str(f"Loss {loss_str} | Stop {stop_str}% | {speed_str} it/s")
-            
             if iteration_counter % args.save_interval == 0:
-                torch.save({'model_state_dict': model.state_dict(), 
+                torch.save({'model_state_dict': model.state_dict(),
                             'optimizer_state_dict': optimizer.state_dict(),
                             'scaler': scaler.state_dict()}, args.model_output)
                 tqdm.write(f" > Model saved ({iteration_counter} iters)")
-        
-        # 5. Check Early Stopping
-        if iteration_counter >= args.min_iterations and args.stop > 0:
-            if len(loss_history) >= 10:
-                hist = list(loss_history)
-                avg_prev = sum(hist[:5]) / 5.0
-                avg_recent = sum(hist[5:]) / 5.0
-                if avg_prev > 1e-9:
-                    change_pct = abs(avg_recent - avg_prev) / avg_prev * 100.0
-                    if change_pct <= args.stop:
-                        tqdm.write(f"\nStopping early: {change_pct:.4f}% <= {args.stop}% tolerance.")
-                        break
+
+        if iteration_counter >= max_iter:
+            print("\nMax iterations reached.")
+            break
+
+        # Early stopping only after a full pass (every window counted)
+        if iteration_counter >= args.min_iterations and args.stop > 0 and len(loss_history) >= 10:
+            hist = list(loss_history)
+            avg_prev = sum(hist[:5]) / 5.0
+            avg_recent = sum(hist[5:]) / 5.0
+            if avg_prev > 1e-9:
+                change_pct = abs(avg_recent - avg_prev) / avg_prev * 100.0
+                if change_pct <= args.stop:
+                    tqdm.write(f"\nStopping early after full pass: {change_pct:.4f}% <= {args.stop}% tolerance.")
+                    break
+        epoch += 1
 
     final_loss = loss_history[-1] if loss_history else 0
     print(f"Training complete. Iterations: {iteration_counter}, Final Loss: {final_loss:.5f}")
-    
-    torch.save({'model_state_dict': model.state_dict(), 
+
+    torch.save({'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scaler': scaler.state_dict()}, args.model_output)
 
@@ -305,7 +278,7 @@ if __name__ == "__main__":
     
     t.add_argument("--batch_size", type=int, default=64)
     t.add_argument("--save_interval", type=int, default=100)
-    t.add_argument("files", nargs="+")
+    t.add_argument("file", help="Single image to train on (one run, one photo)")
     
     r = sub.add_parser("run")
     r.add_argument("--input", required=True)
