@@ -34,25 +34,30 @@ class ArtifactRemovalNet(nn.Module):
     def __init__(self, num_channels=3, num_features=64, num_blocks=8):
         super(ArtifactRemovalNet, self).__init__()
         nf = num_features
-        
+
         self.head = nn.Sequential(nn.Conv2d(num_channels, nf, 3, 1, 1), nn.ReLU(True))
-        
-        # Encoder
+
+        # Encoder: 4 levels (1/2, 1/4, 1/8, 1/16) for multi-scale artifact context
         self.enc1 = nn.Sequential(nn.Conv2d(nf, nf*2, 3, 2, 1), nn.ReLU(True), ResidualBlock(nf*2))
         self.enc2 = nn.Sequential(nn.Conv2d(nf*2, nf*4, 3, 2, 1), nn.ReLU(True), ResidualBlock(nf*4))
         self.enc3 = nn.Sequential(nn.Conv2d(nf*4, nf*8, 3, 2, 1), nn.ReLU(True), ResidualBlock(nf*8))
-        
-        # Bottleneck
-        self.bottleneck = nn.Sequential(*[ResidualBlock(nf*8) for _ in range(max(1, num_blocks//2))])
-        
+        self.enc4 = nn.Sequential(nn.Conv2d(nf*8, nf*16, 3, 2, 1), nn.ReLU(True), ResidualBlock(nf*16))
+
+        # Bottleneck at 1/16 scale
+        self.bottleneck = nn.Sequential(*[ResidualBlock(nf*16) for _ in range(max(1, num_blocks//2))])
+        # Damp the coarsest scale so it contributes but doesn't dominate (learnable, init 0.5)
+        self.coarse_scale = nn.Parameter(torch.tensor(0.5))
+
         # Decoder
+        self.dec4 = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                                  nn.Conv2d(nf*16 + nf*16, nf*8, 3, 1, 1), nn.ReLU(True), ResidualBlock(nf*8))
         self.dec3 = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
                                   nn.Conv2d(nf*8 + nf*8, nf*4, 3, 1, 1), nn.ReLU(True), ResidualBlock(nf*4))
         self.dec2 = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
                                   nn.Conv2d(nf*4 + nf*4, nf*2, 3, 1, 1), nn.ReLU(True), ResidualBlock(nf*2))
         self.dec1 = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
                                   nn.Conv2d(nf*2 + nf*2, nf, 3, 1, 1), nn.ReLU(True), ResidualBlock(nf))
-        
+
         self.tail = nn.Sequential(nn.Conv2d(nf + nf, nf, 3, 1, 1), nn.ReLU(True), nn.Conv2d(nf, num_channels, 3, 1, 1))
 
     def forward(self, x):
@@ -60,8 +65,11 @@ class ArtifactRemovalNet(nn.Module):
         e1 = self.enc1(x_head)
         e2 = self.enc2(e1)
         e3 = self.enc3(e2)
-        b = self.bottleneck(e3)
-        d3 = self.dec3(torch.cat([b, e3], 1))
+        e4 = self.enc4(e3)
+        b = self.bottleneck(e4)
+        b_scaled = self.coarse_scale * b
+        d4 = self.dec4(torch.cat([b_scaled, e4], 1))
+        d3 = self.dec3(torch.cat([d4, e3], 1))
         d2 = self.dec2(torch.cat([d3, e2], 1))
         d1 = self.dec1(torch.cat([d2, e1], 1))
         return self.tail(torch.cat([d1, x_head], 1))
