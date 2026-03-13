@@ -5,6 +5,10 @@ import os
 import cv2
 import numpy as np
 import torch
+from PIL import Image
+
+# Allow large TIFFs when using Pillow
+Image.MAX_IMAGE_PIXELS = None
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
@@ -78,6 +82,31 @@ class ArtifactRemovalNet(nn.Module):
 # Processing Logic
 # ==========================================
 
+def load_image(path):
+    """Load with Pillow; return BGR numpy uint16 or uint8 (no truncation)."""
+    with Image.open(path) as im:
+        if im.mode in ("I;16", "I;16B", "I;16L"):
+            im = im.convert("I;16")
+            arr = np.array(im, dtype=np.uint16)
+        elif im.mode in ("RGB", "RGBA"):
+            arr = np.array(im)
+            if arr.shape[2] == 4:
+                arr = arr[:, :, :3]
+        else:
+            im = im.convert("RGB")
+            arr = np.array(im)
+        if arr.ndim == 2:
+            arr = np.stack([arr] * 3, axis=-1)
+    return arr[:, :, ::-1].copy()  # RGB -> BGR
+
+
+def to_float(img):
+    """uint16 or uint8 -> float [0,1]. Call only when ready to feed the net."""
+    if img.dtype == np.uint16:
+        return (img.astype(np.float32) / 65535.0).clip(0.0, 1.0)
+    return (img.astype(np.float32) / 255.0).clip(0.0, 1.0)
+
+
 def add_chroma_noise(img, n=50, amount=0.01):
     if n <= 0: return img
     h, w, c = img.shape
@@ -130,17 +159,15 @@ def train_mode(args):
 
     model.train()
 
-    gt = cv2.imread(filepath)
-    if gt is None:
-        raise RuntimeError(f"Could not read image: {filepath}")
-
-    tgt = cv2.resize(gt, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_LANCZOS4)
-    qrt = cv2.resize(gt, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_LANCZOS4)
-    qrt_f = qrt.astype(np.float32) / 255.0
-    qrt_f = add_chroma_noise(qrt_f, args.noise_freq, args.noise_amount)
-    qrt_n = (qrt_f * 255.0).astype(np.uint8)
-    h_tgt, w_tgt = tgt.shape[:2]
-    inp = cv2.resize(qrt_n, (w_tgt, h_tgt), interpolation=cv2.INTER_LANCZOS4)
+    gt_raw = load_image(filepath)
+    gt = to_float(gt_raw)
+    del gt_raw
+    h_full, w_full = gt.shape[:2]
+    h_tgt, w_tgt = h_full // 2, w_full // 2
+    tgt = cv2.resize(gt, (w_tgt, h_tgt), interpolation=cv2.INTER_LANCZOS4)
+    qrt = cv2.resize(gt, (w_tgt // 2, h_tgt // 2), interpolation=cv2.INTER_LANCZOS4)
+    qrt = add_chroma_noise(qrt, args.noise_freq, args.noise_amount)
+    inp = cv2.resize(qrt, (w_tgt, h_tgt), interpolation=cv2.INTER_LANCZOS4)
 
     inp_patches = extract_windows(inp, args.window_size)
     tgt_patches = extract_windows(tgt, args.window_size)
@@ -171,8 +198,8 @@ def train_mode(args):
             batch_inp = inp_perm[i:i + args.batch_size]
             batch_tgt = tgt_perm[i:i + args.batch_size]
 
-            batch_inp_t = torch.from_numpy(np.stack([p.astype(np.float32) / 255.0 for p in batch_inp])).permute(0, 3, 1, 2).to(device)
-            batch_tgt_t = torch.from_numpy(np.stack([p.astype(np.float32) / 255.0 for p in batch_tgt])).permute(0, 3, 1, 2).to(device)
+            batch_inp_t = torch.from_numpy(np.stack([p.astype(np.float32) for p in batch_inp])).permute(0, 3, 1, 2).to(device)
+            batch_tgt_t = torch.from_numpy(np.stack([p.astype(np.float32) for p in batch_tgt])).permute(0, 3, 1, 2).to(device)
 
             optimizer.zero_grad()
             with autocast('cuda'):
@@ -232,33 +259,39 @@ def run_mode(args):
     ckpt = torch.load(args.model_input)
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
-    
-    img = cv2.imread(args.input)
-    if img is None: raise FileNotFoundError(args.input)
-    
+
+    img_raw = load_image(args.input)
+    is_16bit = img_raw.dtype == np.uint16
+    img = to_float(img_raw)
+    del img_raw
+
     h, w = img.shape[:2]
-    up = cv2.resize(img, (w*2, h*2), interpolation=cv2.INTER_LANCZOS4)
-    
+    up = cv2.resize(img, (w * 2, h * 2), interpolation=cv2.INTER_LANCZOS4)
+
     ws = args.window_size
-    ph, pw = (ws - up.shape[0]%ws)%ws, (ws - up.shape[1]%ws)%ws
-    if ph>0 or pw>0: up = cv2.copyMakeBorder(up, 0, ph, 0, pw, cv2.BORDER_REFLECT_101)
+    ph, pw = (ws - up.shape[0] % ws) % ws, (ws - up.shape[1] % ws) % ws
+    if ph > 0 or pw > 0:
+        up = cv2.copyMakeBorder(up, 0, ph, 0, pw, cv2.BORDER_REFLECT_101)
     hn, wn = up.shape[:2]
-    
+
     out = np.zeros((hn, wn, 3), dtype=np.float32)
-    
+
     print("Running inference...")
     with torch.no_grad():
         with autocast('cuda'):
             for y in tqdm(range(0, hn, ws), desc="Enhancing"):
                 for x in range(0, wn, ws):
-                    patch = up[y:y+ws, x:x+ws]
-                    bt = torch.from_numpy(patch.astype(np.float32)/255.0).permute(2,0,1).unsqueeze(0).to(device)
-                    res = model(bt).squeeze(0).permute(1,2,0).cpu().numpy()
-                    
-                    corrected = patch.astype(np.float32)/255.0 + res
-                    out[y:y+ws, x:x+ws] = np.clip(corrected, 0, 1)
-                    
-    cv2.imwrite(args.output, (out[:h*2, :w*2]*255).astype(np.uint8))
+                    patch = up[y:y + ws, x:x + ws]
+                    bt = torch.from_numpy(patch.astype(np.float32)).permute(2, 0, 1).unsqueeze(0).to(device)
+                    res = model(bt).squeeze(0).permute(1, 2, 0).cpu().numpy()
+                    corrected = np.clip(patch.astype(np.float32) + res, 0.0, 1.0)
+                    out[y:y + ws, x:x + ws] = corrected
+
+    out_crop = out[: h * 2, : w * 2]
+    if is_16bit:
+        cv2.imwrite(args.output, (np.clip(out_crop, 0.0, 1.0) * 65535.0 + 0.5).astype(np.uint16))
+    else:
+        cv2.imwrite(args.output, (out_crop * 255.0 + 0.5).astype(np.uint8))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
