@@ -1,6 +1,6 @@
 # iq
 
-**Disclaimer:** All of this was vibe-coded. If “I felt the flow and shipped it” sits fine with your ethics, great — welcome aboard and enjoy it. If you need design docs and things, maybe grab a coffee and read the code first. No warranty or guarantee is offered in any eventuality.
+**Disclaimer:** All the code in this repository and most of the documentation has been vibe-coded using Cursor and GLM-5. If “I felt the flow and shipped it” sits fine with your ethics, great — welcome aboard and enjoy it. If you need design docs and things, maybe grab a coffee and read the code first. It serves to solve my problems - if you find the scripts useful, all to the good. No warranty or guarantee is offered in any eventuality.
 
 ---
 
