@@ -7,7 +7,7 @@ In practice, based on training on a few thousand real-world nature photographs, 
 
 ## What it does
 
-- **Train:** Learn from full-resolution images by creating synthetic “low-res → Lanczos upscale” pairs and using the true mid-resolution image as ground truth. The model is trained to predict the **residual** (difference) between the Lanczos result and that ground truth.
+- **Train:** Learn from full-resolution images by creating synthetic “low-res → Lanczos upscale” pairs and using the true mid-resolution image as ground truth. The model is trained to predict the **residual** (difference) between the Lanczos result and that ground truth. It can optionally simulate chroma noise with a view to learning how to "remove" that as well, at the cost of a little detail.
 - **Run:** Load an image, upscale it 2× with Lanczos, then apply the trained model in overlapping or tiled windows to add the learned correction. The result is a 2× super-resolved image with reduced Lanczos artifacts.
 
 ---
@@ -15,7 +15,7 @@ In practice, based on training on a few thousand real-world nature photographs, 
 ## How the training pipeline works
 
 1. **Build a clean “ground truth” at half size**
-   Each training image is downscaled to **50%** (using Lanczos). This half-size image is the **target** the model is trained to match after correction. This eliminates pixel-level artefacts in the source image.
+   Each training image is downscaled to **50%** (using Lanczos). This half-size image is the **target** the model is trained to match after correction. This eliminates pixel-level artefacts in the real source image.
 
 2. **Create the “artifactful” input**
    The same image is downscaled to **25%**, then (optionally) **chroma noise** is applied. That 25% image is then **upscaled back to 50%** using Lanczos. This 50% Lanczos-upscaled image has typical upscaling artifacts (ringing, blur, etc.) but no extra real detail—it’s a degraded version of the 50% ground truth.
@@ -27,7 +27,7 @@ In practice, based on training on a few thousand real-world nature photographs, 
 4. **Training in windows**
    Both the input and the ground truth are split into **non-overlapping windows** (e.g. 32×32). Training proceeds on batches of these windows, so the model sees many small patches per image and can generalize to arbitrary image sizes at run time.
 
-At **run** time, you upscale the image 2× with Lanczos, then run the same model over windows of that upscaled image. The model’s output (the learned residual) is added to the Lanczos result and clipped to [0,1], giving the final super-resolved image. So the script is effectively learning “Lanczos upscaling artifacts vs. reality” and removing those artifacts.
+At **run** time, the script upscales the given image 2× with Lanczos, then runs the same model over windows of that upscaled image. The model’s output (the learned residual) is added to the Lanczos result and clipped to [0,1], giving the final super-resolved image. So the script is learning “Lanczos upscaling artifacts vs. reality” and removing those artifacts.
 
 ---
 
