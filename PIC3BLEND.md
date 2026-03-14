@@ -1,6 +1,6 @@
 # PIC3BLEND
 
-`pic3blend.py` processes **collections of images** in `coll-*` directories: it upscales them, optionally super-resolves at 2×, aligns them, optionally corrects ghosting, then blends them into a single 16‑bit TIFF. The **blend mode** (mean, HDR, focus stack, min/median/max) is inferred from the directory name (or overridden with `--mode`).
+`pic3blend.py` processes **collections of images** in `./coll-*` directories: it upscales them or optionally super-resolves at 2×, aligns them, corrects ghosting, then blends them into a single 16‑bit TIFF. The **blend mode** (mean, HDR, focus stack, min/median/max) is inferred from the directory name or specified with `--mode`.
 
 ---
 
@@ -9,7 +9,7 @@
 A batch pipeline that:
 
 1. **Finds** all subdirectories matching  `./coll-*`.
-2. **In each directory:** loads images, upscales them (Lanczos or, at scale 2, super-resolve), aligns every image to the first, optionally runs ghosting correction, then blends with the mode implied by the directory name.
+2. **In each directory:** loads images, upscales them (Lanczos or, if the scale factor is 2 and `--model` specifies a path to a pretrained model, super-resolves), aligns every image to the first, optionally runs ghosting correction, then blends with the mode implied by the directory name.
 3. **Writes** one 16‑bit TIFF per directory: `{blend-type}_{align-algorithm}_{basefilename}.tiff`.
 
 Alignment uses OpenCV (AKAZE then ECC fallback); warping, ghosting, and built-in blending use the GPU (CUDA or Metal MPS) when available.
@@ -26,7 +26,7 @@ Alignment uses OpenCV (AKAZE then ECC fallback); warping, ghosting, and built-in
 
 ## How to run it
 
-From the directory that contains your `coll-*` folders:
+From the directory that contains your `./coll-*` folders:
 
 ```bash
 pip install -r requirements-pic3blend.txt
@@ -67,21 +67,21 @@ The script discovers all `coll-*` directories under the current working director
 
 ```
 ./
-  coll-mean/
+  coll-mean-01/
     DSC_001.jpg
     DSC_002.jpg
     DSC_003.jpg
-  coll-hdr/
+  coll-hdr-02/
     exp1.png
     exp2.png
     exp3.png
-  coll-focus/
+  coll-focus-03/
     f1.tif
     f2.tif
     f3.tif
 ```
 
-After running, you get e.g. `mean_akaze_DSC_001.tiff`, `hdr_akaze_exp1.tiff`, `focus_akaze_f1.tiff` inside each directory.
+After running, you get e.g. `mean_akaze_DSC_001.tiff`, `hdr_akaze_exp1.tiff`, `focus_akaze_f1.tiff` inside each respective directory.
 
 ---
 
@@ -95,8 +95,8 @@ For each `coll-*` directory, in order:
 2. **Alignment**
    All upscaled images are aligned to the first (base) image. The alignment method is the first available from `--align` (default: AKAZE, then ECC). Warping runs on GPU when possible.
 
-3. **Ghosting (optional)**
-   If `--ghosting 1` is set, a post-alignment step runs: pixels with high variance across the stack are replaced with the stack median to reduce double images / moving-object artefacts. Blend mode is unchanged.
+3. **Ghosting (optional, default)**
+   If `--ghosting 1` is set (as it is by default), a post-alignment step runs: pixels with high variance across the stack are replaced with the stack median to reduce double images / moving-object artefacts. Blend mode is unchanged.
 
 4. **Blending**
    The aligned (and optionally ghost-corrected) stack is blended according to the mode:
