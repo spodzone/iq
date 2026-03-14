@@ -138,11 +138,11 @@ def extract_windows(img, ws):
 # Main Logic
 # ==========================================
 
+
 def train_mode(args):
     filepath = args.file
     if not os.path.exists(filepath):
         raise FileNotFoundError(filepath)
-    print(f"Training on single image: {os.path.basename(filepath)}")
 
     model = ArtifactRemovalNet().to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
@@ -168,20 +168,21 @@ def train_mode(args):
     qrt = cv2.resize(gt, (w_tgt // 2, h_tgt // 2), interpolation=cv2.INTER_LANCZOS4)
     qrt = add_chroma_noise(qrt, args.noise_freq, args.noise_amount)
     inp = cv2.resize(qrt, (w_tgt, h_tgt), interpolation=cv2.INTER_LANCZOS4)
-
     inp_patches = extract_windows(inp, args.window_size)
     tgt_patches = extract_windows(tgt, args.window_size)
     n_patches = len(inp_patches)
     batches_per_epoch = (n_patches + args.batch_size - 1) // args.batch_size
+    max_iter = args.max_iterations if args.max_iterations > 0 else float('inf')
+
+    print(f"Training on single image: {os.path.basename(filepath)}")
+    print(f"Config: {n_patches} windows, {batches_per_epoch} batches/epoch | Min {args.min_iterations} | Max {max_iter} | Stop {args.stop}% | Window {args.window_size}")
+    print("Stop/max checked only after a full epoch (every pixel seen once).")
 
     iteration_counter = 0
     loss_history = deque(maxlen=10)
-    max_iter = args.max_iterations if args.max_iterations > 0 else float('inf')
     start_time = time.time()
-
-    print(f"Config: {n_patches} windows, {batches_per_epoch} batches/epoch | Min {args.min_iterations} | Max {max_iter} | Stop {args.stop}% | Window {args.window_size}")
-
     epoch = 0
+
     while True:
         indices = np.arange(n_patches)
         np.random.shuffle(indices)
@@ -190,14 +191,10 @@ def train_mode(args):
 
         pbar = tqdm(range(0, n_patches, args.batch_size), desc=f"Epoch {epoch}", leave=False,
                     bar_format='{desc} {bar} {postfix}')
-        epoch_losses = []
 
         for i in pbar:
-            if iteration_counter >= max_iter:
-                break
             batch_inp = inp_perm[i:i + args.batch_size]
             batch_tgt = tgt_perm[i:i + args.batch_size]
-
             batch_inp_t = torch.from_numpy(np.stack([p.astype(np.float32) for p in batch_inp])).permute(0, 3, 1, 2).to(device)
             batch_tgt_t = torch.from_numpy(np.stack([p.astype(np.float32) for p in batch_tgt])).permute(0, 3, 1, 2).to(device)
 
@@ -211,7 +208,6 @@ def train_mode(args):
 
             current_loss = loss.item()
             loss_history.append(current_loss)
-            epoch_losses.append(current_loss)
             iteration_counter += 1
 
             stop_pct_val = 0.0
@@ -231,11 +227,10 @@ def train_mode(args):
                             'scaler': scaler.state_dict()}, args.model_output)
                 tqdm.write(f" > Model saved ({iteration_counter} iters)")
 
+        # Only after a full epoch: allow max_iter or early-stop
         if iteration_counter >= max_iter:
             print("\nMax iterations reached.")
             break
-
-        # Early stopping only after a full pass (every window counted)
         if iteration_counter >= args.min_iterations and args.stop > 0 and len(loss_history) >= 10:
             hist = list(loss_history)
             avg_prev = sum(hist[:5]) / 5.0
@@ -311,7 +306,7 @@ if __name__ == "__main__":
     
     t.add_argument("--batch_size", type=int, default=64)
     t.add_argument("--save_interval", type=int, default=100)
-    t.add_argument("file", help="Single image to train on (one run, one photo)")
+    t.add_argument("file", help="Single image to train on (one run = one file; use resume for chaining)")
     
     r = sub.add_parser("run")
     r.add_argument("--input", required=True)
