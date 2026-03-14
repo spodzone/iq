@@ -38,24 +38,29 @@ The script has two subcommands: **`train`** and **`run`**. All options are descr
 
 ### Train options
 
-Use: `python super-resolve.py train [options] --model_output <path> file1 [file2 ...]`
+Use: `python super-resolve.py train [options] --model_output <path> <file>`
+
+**One run = one file.** You pass a single image path. Training runs epoch after epoch over that image’s windows until max-iterations or early-stop. To train on many images (e.g. thousands of photos), run the script once per image and reuse `--model_output`: each run resumes from the same checkpoint, so you chain runs without multi-file logic.
 
 - **Required**
   - **`--model_output`**
-    Path where the checkpoint will be written (and read when resuming). The script saves the model state, optimizer state, and optional GradScaler state. If this file already exists, training **resumes** from it (same weights, optimizer, and scaler).
+    Path where the checkpoint will be written (and read when resuming). The script saves the model state, optimizer state, and GradScaler state. If this file already exists, training **resumes** from it (same weights, optimizer, scaler).
 
-  - **`files`** (positional, one or more)
-    List of image paths used for training. Each image is loaded, the 50% / 25% pipeline is applied, and windows are extracted. The script cycles through these files until stopping conditions are met.
+  - **`file`** (positional, single)
+    The one image to train on for this run. Full-resolution input; the script builds 50% ground truth and 25%→50% Lanczos input, extracts windows, and trains on batches of those windows.
 
 - **Iteration control**
+  - **Epochs and iterations**
+    One **epoch** = one full pass over all windows of the single image (every pixel seen once, window order shuffled each epoch). One **iteration** = one batch (forward + backward). Stop and max checks happen **only after a full epoch**, so the model always gets at least one full pass over the image before stopping.
+
   - **`--min-iterations`** (int, default: `0`)
-    Minimum number of training iterations (forward + backward passes) before the script is allowed to stop. If the file list is exhausted before this, the script restarts from the first file and keeps training until at least `min-iterations` is reached. Use this to ensure a minimum amount of learning before considering early stopping or “dataset exhausted.”
+    Minimum number of iterations before the script is allowed to stop. Early stopping is not considered until iteration count ≥ this.
 
   - **`--max-iterations`** (int, default: `0`)
-    Hard cap on the number of training iterations. `0` means no cap (train until early stop or dataset exhausted). Any positive value stops training as soon as the iteration count reaches it.
+    Hard cap on iterations. `0` = no cap (train until early stop). Positive value stops as soon as the count reaches it (at end of an epoch).
 
   - **`--stop`** (float, default: `0.0`)
-    Early-stopping tolerance in percent. After `min_iterations`, every 10 iterations the script compares the average loss of the previous 5 iterations with the average of the 5 before that. If the relative change is **≤ `--stop`%**, training stops (“loss has stabilized within tolerance”). Set to `0` to disable early stopping.
+    Early-stopping tolerance in percent. Checked only at **end of each full epoch**. The script compares the average loss over the last 5 steps with the average over the 5 before that (from the last 10 steps). If the relative change is **≤ `--stop`%**, training stops. Set to `0` to disable.
 
 - **Spatial / batching**
   - **`--window_size`** (int, default: `32`)
@@ -83,7 +88,7 @@ Use: `python super-resolve.py run --input <path> --model_input <path> --output <
 
 - **Required**
   - **`--input`**
-    Path to the input image to super-resolve. Any format supported by OpenCV (e.g. PNG, JPEG) is fine.
+    Path to the input image to super-resolve. Loaded with Pillow (PNG, JPEG, 16-bit TIFF, etc.). Output bit depth matches input (8-bit or 16-bit).
 
   - **`--model_input`**
     Path to the saved checkpoint file (the same format written by `train --model_output`). Only the `model_state_dict` is loaded; optimizer and scaler are ignored.
@@ -103,7 +108,7 @@ Use: `python super-resolve.py run --input <path> --model_input <path> --output <
 super-resolve.py
 ├── train
 │   ├── --model_output (required)
-│   ├── files (required, positional, one or more)
+│   ├── file (required, positional, single image; one run = one file)
 │   ├── --window_size (default: 32)
 │   ├── --min-iterations (default: 0)
 │   ├── --max-iterations (default: 0)
@@ -124,7 +129,7 @@ super-resolve.py
 
 ## Example
 
-**Train** for at least 2000 iterations, stop when loss change is under 1%, save every 200 steps:
+**Train** on one image: at least 2000 iterations, stop when loss change is under 1%, save every 200 steps:
 
 ```bash
 python super-resolve.py train \
@@ -134,7 +139,15 @@ python super-resolve.py train \
   --stop 1.0 \
   --save_interval 200 \
   --window_size 32 \
-  image1.png image2.png image3.png
+  photo.png
+```
+
+To train on many images, run once per image and reuse the same `--model_output`; each run resumes from the checkpoint:
+
+```bash
+for f in /path/to/photos/*.tiff; do
+  python super-resolve.py train --model_output model.pt --min-iterations 2000 --stop 1.0 "$f"
+done
 ```
 
 **Run** inference on a single image:
@@ -147,4 +160,4 @@ python super-resolve.py run \
   --window_size 32
 ```
 
-`super.png` will be twice the width and height of `lowres.png`, with Lanczos artifacts reduced by the learned residual.
+`super.png` will be twice the width and height of `lowres.png`, with Lanczos artifacts reduced by the learned residual. Input/output bit depth (8-bit vs 16-bit) is preserved; images are loaded with Pillow (including 16-bit TIFF) and written in the same depth as the input.
