@@ -61,8 +61,8 @@ Use: `python super-resolve.py train [options] --model_output <path> file1 [file2
   - **`--window_size`** (int, default: `32`)
     Side length (in pixels) of the square windows used for training (and for run). Input and ground truth are tiled into non-overlapping `window_size × window_size` patches (with reflection padding if dimensions aren’t divisible). Must match at run time if you change it (same value should be used for `run --window_size`).
 
-  - **`--batch_size`** (int, default: `64`)
-    Number of windows per training step. Larger values use more GPU memory but can give more stable gradients. Reduce if you run out of memory.
+  - **`--batch_size`** (int, default: `256`)
+    Number of windows (patches) per training step. Larger = more VRAM used and typically better GPU utilization (fewer steps, more work per kernel). Tune up until you're near your VRAM limit; reduce if you OOM.
 
 - **Checkpointing**
   - **`--save_interval`** (int, default: `100`)
@@ -108,7 +108,7 @@ super-resolve.py
 │   ├── --min-iterations (default: 0)
 │   ├── --max-iterations (default: 0)
 │   ├── --stop (default: 0.0)
-│   ├── --batch_size (default: 64)
+│   ├── --batch_size (default: 256)
 │   ├── --save_interval (default: 100)
 │   ├── --noise_freq (default: 50)
 │   └── --noise_amount (default: 0.01)

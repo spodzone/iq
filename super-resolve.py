@@ -304,7 +304,8 @@ if __name__ == "__main__":
     t.add_argument("--max-iterations", type=int, default=0)
     t.add_argument("--stop", type=float, default=0.0)
     
-    t.add_argument("--batch_size", type=int, default=64)
+    t.add_argument("--batch_size", type=int, default=256,
+               help="Patches per step; larger = more VRAM, better GPU utilization (tune for your 16GB)")
     t.add_argument("--save_interval", type=int, default=100)
     t.add_argument("file", help="Single image to train on (one run = one file; use resume for chaining)")
     
