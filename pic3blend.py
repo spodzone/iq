@@ -623,6 +623,7 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_list, ghostin
     def _upscale_one(idx, path):
         up_path = os.path.join(tmpdir, f"up_{idx:04d}.tif")
         if os.path.exists(up_path):
+            tlog(f"{os.path.basename(coll_dir)}: upscaled exists, skip {os.path.basename(up_path)}")
             return
         img = load_image(path)
         if img is None:
@@ -638,6 +639,8 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_list, ghostin
                 if not os.path.exists(tmp_in):
                     cv2.imwrite(tmp_in, img)
                 run_super_resolve(tmp_in, tmp_out, model_path, script_dir)
+            else:
+                tlog(f"{os.path.basename(coll_dir)}: super-resolved exists, skip {os.path.basename(tmp_out)}")
             up = load_image(tmp_out)
             if up is not None:
                 if up.dtype == np.uint8:
