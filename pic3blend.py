@@ -12,6 +12,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from datetime import datetime
 
 import cv2
@@ -29,11 +31,37 @@ import shutil
 # Common image extensions (OpenCV imread)
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"}
 
+_LOG_LOCK = threading.Lock()
+
 
 def tlog(msg):
-    """Emit a timestamped info log entry to stderr."""
+    """Emit a timestamped info log entry to stderr and append to blend.log."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}", file=sys.stderr, flush=True)
+    line = f"[{ts}] {msg}"
+    print(line, file=sys.stderr, flush=True)
+    try:
+        with _LOG_LOCK:
+            with open(os.path.join(os.getcwd(), "blend.log"), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        # Logging must never break processing
+        pass
+
+
+def _phase_start(phase_name, coll_dir=None):
+    """Log phase start; return perf_counter timestamp."""
+    prefix = f"{os.path.basename(coll_dir)}: " if coll_dir else ""
+    tlog(f"{prefix}start {phase_name}")
+    return time.perf_counter()
+
+
+def _phase_end(phase_name, t0, timings, coll_dir=None):
+    """Log phase end with duration; record into timings dict."""
+    dt = time.perf_counter() - t0
+    timings[phase_name] = timings.get(phase_name, 0.0) + dt
+    prefix = f"{os.path.basename(coll_dir)}: " if coll_dir else ""
+    tlog(f"{prefix}end {phase_name} ({dt:.2f}s)")
+    return dt
 
 
 def get_device():
@@ -552,7 +580,7 @@ def run_enfuse_focus(input_paths, output_path):
     subprocess.run(cmd, check=True)
 
 
-def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosting, mode_override, script_dir, device, threads, keep_tmp):
+def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosting, mode_override, script_dir, device, threads, keep_tmp, timings):
     """Process one coll-* directory and write output TIFF. Intermediates go to /tmp/iq-{basefilename}."""
     files = image_files_in_dir(coll_dir)
     if not files:
@@ -574,7 +602,7 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
     os.makedirs(tmpdir, exist_ok=True)
 
     # Load and upscale; write upscaled images to tmpdir to avoid I/O on (possibly network) photo dir
-    tlog(f"{os.path.basename(coll_dir)}: start upscaling")
+    t0 = _phase_start("upscaling/SR", coll_dir=coll_dir)
     scale_is_two = (abs(scale_x - 2.0) < 1e-6 and abs(scale_y - 2.0) < 1e-6)
     use_super_resolve = scale_is_two and model_path and os.path.isfile(model_path)
 
@@ -610,6 +638,7 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
     with ThreadPoolExecutor(max_workers=max(1, threads)) as ex:
         for idx, f in enumerate(files):
             ex.submit(_upscale_one, idx, f)
+    _phase_end("upscaling/SR", t0, timings, coll_dir=coll_dir)
 
     images = _read_images_from_tmpdir(tmpdir, "up_")
     if not images:
@@ -619,7 +648,7 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
         return
 
     # Align (all to first); warping uses GPU when available; write aligned to tmpdir
-    tlog(f"{os.path.basename(coll_dir)}: start aligning")
+    t0 = _phase_start("alignment", coll_dir=coll_dir)
     n_images = len(images)
     al_paths = [os.path.join(tmpdir, f"al_{i:04d}.tif") for i in range(n_images)]
     if all(os.path.exists(p) for p in al_paths):
@@ -635,9 +664,11 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
                 cv2.imwrite(p, _to_u16(im))
         aligned = _read_images_from_tmpdir(tmpdir, "al_")
 
+    _phase_end("alignment", t0, timings, coll_dir=coll_dir)
+
     # Ghosting correction (separate step after alignment; read/write tmpdir)
     if ghosting and len(aligned) > 1:
-        tlog(f"{os.path.basename(coll_dir)}: start ghosting")
+        t0 = _phase_start("ghosting", coll_dir=coll_dir)
         gh_paths = [os.path.join(tmpdir, f"gh_{i:04d}.tif") for i in range(len(aligned))]
         if not all(os.path.exists(p) for p in gh_paths):
             deghosted = correct_ghosting(aligned, device=device)
@@ -646,11 +677,12 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
                 if not os.path.exists(p):
                     cv2.imwrite(p, _to_u16(im))
         blend_prefix = "gh_"
+        _phase_end("ghosting", t0, timings, coll_dir=coll_dir)
     else:
         blend_prefix = "al_"
 
     # Blend (uses GPU when available); final output first goes to tmpdir, then is copied to coll_dir
-    tlog(f"{os.path.basename(coll_dir)}: start blending")
+    t0 = _phase_start(f"blend/{blend_type}", coll_dir=coll_dir)
     tmp_out_path = os.path.join(tmpdir, out_name)
 
     if blend_type == "mean":
@@ -680,6 +712,7 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
             cv2.imwrite(p, _to_u16(im))
             paths.append(p)
         run_enfuse_focus(paths, tmp_out_path)
+    _phase_end(f"blend/{blend_type}", t0, timings, coll_dir=coll_dir)
 
     # Copy EXIF from base into tmp result, then copy final result into the real output directory
     try:
@@ -720,14 +753,24 @@ def main():
     align_order = [a.strip().lower() for a in args.align.split(",") if a.strip()]
     device = get_device()
     print(f"Using device: {device}", file=sys.stderr)
-    tlog("started")
+    timings = {}
+    t0_all = _phase_start("script", coll_dir=None)
     coll_dirs = sorted(glob.glob(os.path.join(os.getcwd(), "coll-*")))
     if not coll_dirs:
         coll_dirs = sorted(glob.glob("coll-*"))
     for d in coll_dirs:
         if os.path.isdir(d):
             process_coll_dir(d, scale_x, scale_y, args.model, align_order, args.ghosting == 1,
-                             args.mode_override, script_dir, device, args.threads, args.keep)
+                             args.mode_override, script_dir, device, args.threads, args.keep, timings)
+    _phase_end("script", t0_all, timings, coll_dir=None)
+    # Summary
+    tlog("phase timing summary:")
+    for k in sorted(timings.keys()):
+        if k == "script":
+            continue
+        tlog(f"  {k}: {timings[k]:.2f}s")
+    if "script" in timings:
+        tlog(f"  TOTAL: {timings['script']:.2f}s")
 
 
 if __name__ == "__main__":
