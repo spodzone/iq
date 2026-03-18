@@ -158,12 +158,18 @@ def _tmpdir_for_base(base_name):
     return f"/tmp/iq-{safe}"
 
 
+def _paths_in_tmpdir(tmpdir, prefix):
+    """Return sorted list of full paths to files in tmpdir whose filenames start with prefix."""
+    names = sorted(f for f in os.listdir(tmpdir) if f.startswith(prefix) and os.path.isfile(os.path.join(tmpdir, f)))
+    return [os.path.join(tmpdir, n) for n in names]
+
+
 def _read_images_from_tmpdir(tmpdir, prefix):
     """Read images from tmpdir whose filenames start with prefix, sorted by name. Return list of BGR arrays."""
-    names = sorted(f for f in os.listdir(tmpdir) if f.startswith(prefix) and os.path.isfile(os.path.join(tmpdir, f)))
+    paths = _paths_in_tmpdir(tmpdir, prefix)
     out = []
-    for n in names:
-        im = load_image(os.path.join(tmpdir, n))
+    for p in paths:
+        im = load_image(p)
         if im is not None:
             out.append(im)
     return out
@@ -546,7 +552,7 @@ def run_enfuse_focus(input_paths, output_path):
     subprocess.run(cmd, check=True)
 
 
-def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosting, mode_override, script_dir, device, threads):
+def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosting, mode_override, script_dir, device, threads, keep_tmp):
     """Process one coll-* directory and write output TIFF. Intermediates go to /tmp/iq-{basefilename}."""
     files = image_files_in_dir(coll_dir)
     if not files:
@@ -616,9 +622,9 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
         aligned = correct_ghosting(aligned, device=device)
         for i, im in enumerate(aligned):
             cv2.imwrite(os.path.join(tmpdir, f"gh_{i:04d}.tif"), _to_u16(im))
-        aligned = _read_images_from_tmpdir(tmpdir, "gh_")
+        blend_prefix = "gh_"
     else:
-        aligned = _read_images_from_tmpdir(tmpdir, "al_")
+        blend_prefix = "al_"
 
     # Blend (uses GPU when available); final output first goes to tmpdir, then is copied to coll_dir
     tlog(f"{os.path.basename(coll_dir)}: start blending")
@@ -626,11 +632,19 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
     tmp_out_path = os.path.join(tmpdir, out_name)
     final_out_path = os.path.join(coll_dir, out_name)
 
-    if blend_type in ("mean", "min", "median", "max"):
+    if blend_type == "mean":
+        # Rolling average: stream one image at a time; only two in memory (current + running mean)
+        paths = _paths_in_tmpdir(tmpdir, blend_prefix)
+        out_float = _rolling_mean_blend(paths, device=device)
+        out_16 = float_to_16bit_tiff(out_float)
+        cv2.imwrite(tmp_out_path, out_16)
+    elif blend_type in ("min", "median", "max"):
+        aligned = _read_images_from_tmpdir(tmpdir, blend_prefix)
         out_float = _stack_blend(aligned, kind=blend_type, device=device)
         out_16 = float_to_16bit_tiff(out_float)
         cv2.imwrite(tmp_out_path, out_16)
     elif blend_type == "hdr":
+        aligned = _read_images_from_tmpdir(tmpdir, blend_prefix)
         paths = []
         for i, im in enumerate(aligned):
             p = os.path.join(tmpdir, f"enfuse_hdr_{i:04d}.tif")
@@ -638,6 +652,7 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
             paths.append(p)
         run_enfuse_hdr(paths, tmp_out_path)
     elif blend_type == "focus":
+        aligned = _read_images_from_tmpdir(tmpdir, blend_prefix)
         paths = []
         for i, im in enumerate(aligned):
             p = os.path.join(tmpdir, f"enfuse_focus_{i:04d}.tif")
@@ -652,8 +667,11 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
         tlog(f"{os.path.basename(coll_dir)}: wrote {out_name}")
         print(f"[{os.path.basename(coll_dir)}] -> {out_name}")
     finally:
-        # Clean up temporary directory for this collection
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        # Clean up temporary directory for this collection unless --keep was requested
+        if keep_tmp:
+            tlog(f"{os.path.basename(coll_dir)}: keeping tmpdir {tmpdir}")
+        else:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def main():
@@ -673,6 +691,8 @@ def main():
                     help="Override blend mode (otherwise inferred from directory name)")
     ap.add_argument("--threads", type=int, default=3,
                     help="Number of threads for the upscaling phase (default 3)")
+    ap.add_argument("--keep", action="store_true",
+                    help="Keep per-coll tmp dirs (upscaled/aligned/deghosted) instead of deleting them")
     args = ap.parse_args()
 
     scale_x, scale_y = parse_scale(args.scale)
@@ -686,7 +706,7 @@ def main():
     for d in coll_dirs:
         if os.path.isdir(d):
             process_coll_dir(d, scale_x, scale_y, args.model, align_order, args.ghosting == 1,
-                             args.mode_override, script_dir, device, args.threads)
+                             args.mode_override, script_dir, device, args.threads, args.keep)
 
 
 if __name__ == "__main__":
