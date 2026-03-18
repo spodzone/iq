@@ -70,6 +70,7 @@ def main():
     shape = None
 
     for path in paths:
+        print(f"Reading {path}", file=sys.stderr, flush=True)
         img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
         if img is None:
             print(f"Warning: could not read {path}, skipping.", file=sys.stderr)
