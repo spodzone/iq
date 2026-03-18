@@ -435,6 +435,48 @@ def correct_ghosting(images, variance_percentile=95.0, device=None):
     return out
 
 
+def _rolling_mean_blend(paths, device=None):
+    """Compute mean of images by streaming one at a time (running average). Only two images in memory at once.
+    paths: list of paths to image files (e.g. tmpdir al_/gh_ TIFFs). Returns float array [0,1] HWC."""
+    if not paths:
+        raise ValueError("_rolling_mean_blend requires at least one path")
+    use_gpu = device is not None and device.type in ("cuda", "mps")
+    n = 0
+    running_mean = None
+    for p in paths:
+        im = load_image(p)
+        if im is None:
+            continue
+        if im.dtype == np.uint16:
+            f = im.astype(np.float64) / 65535.0
+        else:
+            f = im.astype(np.float64) / 255.0
+        f = np.clip(f, 0.0, 1.0)
+        if use_gpu:
+            t = _numpy_to_tensor(im, device)  # CHW [0,1]
+            if n == 0:
+                running_mean = t.clone()
+                n = 1
+            else:
+                n += 1
+                running_mean.add_(t.sub(running_mean).div_(n))
+            del t
+        else:
+            if n == 0:
+                running_mean = f.copy()
+                n = 1
+            else:
+                n += 1
+                running_mean += (f - running_mean) / n
+    if running_mean is None:
+        raise ValueError("_rolling_mean_blend: no valid image loaded")
+    if use_gpu:
+        out = running_mean.clamp(0, 1).cpu().numpy().transpose(1, 2, 0)
+    else:
+        out = np.clip(running_mean, 0.0, 1.0)
+    return out
+
+
 def _stack_blend(images, kind="mean", device=None):
     """kind: mean, min, median, max. Uses GPU when device is cuda/mps. Returns float array in [0,1]."""
     if device is None:
