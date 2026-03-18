@@ -106,6 +106,21 @@ def parse_scale(s):
     return v, v
 
 
+def _parse_csv_list(values):
+    """Parse a comma-separated list or list of comma-separated strings; returns lowercased tokens."""
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    out = []
+    for v in values:
+        for t in str(v).split(","):
+            t = t.strip().lower()
+            if t:
+                out.append(t)
+    return out
+
+
 def image_files_in_dir(d):
     """Return sorted list of image file paths in directory d."""
     names = [
@@ -412,6 +427,10 @@ def detect_blend_type(dirname):
     return "mean"  # default
 
 
+_VALID_MODES = {"mean", "hdr", "focus", "min", "median", "max"}
+_VALID_ALIGNS = {"akaze", "ecc"}
+
+
 def correct_ghosting(images, variance_percentile=95.0, device=None):
     """
     Post-alignment ghosting correction: at pixels where variance across the stack
@@ -580,7 +599,7 @@ def run_enfuse_focus(input_paths, output_path):
     subprocess.run(cmd, check=True)
 
 
-def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosting, mode_override, script_dir, device, threads, keep_tmp, timings):
+def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_list, ghosting, mode_list, script_dir, device, threads, keep_tmp, timings):
     """Process one coll-* directory and write output TIFF. Intermediates go to /tmp/iq-{basefilename}."""
     files = image_files_in_dir(coll_dir)
     if not files:
@@ -588,15 +607,10 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
         return
     base_path = files[0]
     base_name = os.path.splitext(os.path.basename(base_path))[0]
-    blend_type = mode_override if mode_override else detect_blend_type(coll_dir)
-    align_used = align_order[0] if align_order else "none"
-
-    out_name = f"{blend_type}_{align_used}_{base_name}.tiff"
-    final_out_path = os.path.join(coll_dir, out_name)
-    if os.path.exists(final_out_path):
-        tlog(f"{os.path.basename(coll_dir)}: final exists, skip {out_name}")
-        print(f"[{os.path.basename(coll_dir)}] (skip) -> {out_name}")
-        return
+    if not mode_list:
+        mode_list = [detect_blend_type(coll_dir)]
+    if not align_list:
+        align_list = ["none"]
 
     tmpdir = _tmpdir_for_base(base_name)
     os.makedirs(tmpdir, exist_ok=True)
@@ -647,79 +661,98 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
             shutil.rmtree(tmpdir, ignore_errors=True)
         return
 
-    # Align (all to first); warping uses GPU when available; write aligned to tmpdir
-    t0 = _phase_start("alignment", coll_dir=coll_dir)
-    n_images = len(images)
-    al_paths = [os.path.join(tmpdir, f"al_{i:04d}.tif") for i in range(n_images)]
-    if all(os.path.exists(p) for p in al_paths):
-        aligned = _read_images_from_tmpdir(tmpdir, "al_")
-    else:
-        if len(align_order) > 0:
-            aligned = align_images_simple(images, align_order, ref_index=0, device=device)
-        else:
-            aligned = images
-        for i, im in enumerate(aligned):
-            p = al_paths[i]
-            if not os.path.exists(p):
-                cv2.imwrite(p, _to_u16(im))
-        aligned = _read_images_from_tmpdir(tmpdir, "al_")
-
-    _phase_end("alignment", t0, timings, coll_dir=coll_dir)
-
-    # Ghosting correction (separate step after alignment; read/write tmpdir)
-    if ghosting and len(aligned) > 1:
-        t0 = _phase_start("ghosting", coll_dir=coll_dir)
-        gh_paths = [os.path.join(tmpdir, f"gh_{i:04d}.tif") for i in range(len(aligned))]
-        if not all(os.path.exists(p) for p in gh_paths):
-            deghosted = correct_ghosting(aligned, device=device)
-            for i, im in enumerate(deghosted):
-                p = gh_paths[i]
-                if not os.path.exists(p):
-                    cv2.imwrite(p, _to_u16(im))
-        blend_prefix = "gh_"
-        _phase_end("ghosting", t0, timings, coll_dir=coll_dir)
-    else:
-        blend_prefix = "al_"
-
-    # Blend (uses GPU when available); final output first goes to tmpdir, then is copied to coll_dir
-    t0 = _phase_start(f"blend/{blend_type}", coll_dir=coll_dir)
-    tmp_out_path = os.path.join(tmpdir, out_name)
-
-    if blend_type == "mean":
-        # Rolling average: stream one image at a time; only two in memory (current + running mean)
-        paths = _paths_in_tmpdir(tmpdir, blend_prefix)
-        out_float = _rolling_mean_blend(paths, device=device)
-        out_16 = float_to_16bit_tiff(out_float)
-        cv2.imwrite(tmp_out_path, out_16)
-    elif blend_type in ("min", "median", "max"):
-        aligned = _read_images_from_tmpdir(tmpdir, blend_prefix)
-        out_float = _stack_blend(aligned, kind=blend_type, device=device)
-        out_16 = float_to_16bit_tiff(out_float)
-        cv2.imwrite(tmp_out_path, out_16)
-    elif blend_type == "hdr":
-        aligned = _read_images_from_tmpdir(tmpdir, blend_prefix)
-        paths = []
-        for i, im in enumerate(aligned):
-            p = os.path.join(tmpdir, f"enfuse_hdr_{i:04d}.tif")
-            cv2.imwrite(p, _to_u16(im))
-            paths.append(p)
-        run_enfuse_hdr(paths, tmp_out_path)
-    elif blend_type == "focus":
-        aligned = _read_images_from_tmpdir(tmpdir, blend_prefix)
-        paths = []
-        for i, im in enumerate(aligned):
-            p = os.path.join(tmpdir, f"enfuse_focus_{i:04d}.tif")
-            cv2.imwrite(p, _to_u16(im))
-            paths.append(p)
-        run_enfuse_focus(paths, tmp_out_path)
-    _phase_end(f"blend/{blend_type}", t0, timings, coll_dir=coll_dir)
-
-    # Copy EXIF from base into tmp result, then copy final result into the real output directory
     try:
-        _copy_exif_from_base(base_path, tmp_out_path)
-        shutil.copy2(tmp_out_path, final_out_path)
-        tlog(f"{os.path.basename(coll_dir)}: wrote {out_name}")
-        print(f"[{os.path.basename(coll_dir)}] -> {out_name}")
+        n_images = len(images)
+
+        for algo in align_list:
+            algo = algo.strip().lower()
+            if algo == "none":
+                aligned_prefix = "al_none_"
+                al_paths = [os.path.join(tmpdir, f"{aligned_prefix}{i:04d}.tif") for i in range(n_images)]
+                if not all(os.path.exists(p) for p in al_paths):
+                    t0 = _phase_start("alignment/none", coll_dir=coll_dir)
+                    for i, im in enumerate(images):
+                        p = al_paths[i]
+                        if not os.path.exists(p):
+                            cv2.imwrite(p, _to_u16(im))
+                    _phase_end("alignment/none", t0, timings, coll_dir=coll_dir)
+            else:
+                aligned_prefix = f"al_{algo}_"
+                al_paths = [os.path.join(tmpdir, f"{aligned_prefix}{i:04d}.tif") for i in range(n_images)]
+                if not all(os.path.exists(p) for p in al_paths):
+                    t0 = _phase_start(f"alignment/{algo}", coll_dir=coll_dir)
+                    aligned = align_images_simple(images, [algo], ref_index=0, device=device)
+                    for i, im in enumerate(aligned):
+                        p = al_paths[i]
+                        if not os.path.exists(p):
+                            cv2.imwrite(p, _to_u16(im))
+                    _phase_end(f"alignment/{algo}", t0, timings, coll_dir=coll_dir)
+
+            # Ghosting per alignment algorithm (optional)
+            blend_prefix = aligned_prefix
+            if ghosting and n_images > 1:
+                gh_prefix = f"gh_{algo}_"
+                gh_paths = [os.path.join(tmpdir, f"{gh_prefix}{i:04d}.tif") for i in range(n_images)]
+                if all(os.path.exists(p) for p in gh_paths):
+                    blend_prefix = gh_prefix
+                else:
+                    t0 = _phase_start(f"ghosting/{algo}", coll_dir=coll_dir)
+                    aligned_stack = _read_images_from_tmpdir(tmpdir, aligned_prefix)
+                    deghosted = correct_ghosting(aligned_stack, device=device)
+                    for i, im in enumerate(deghosted):
+                        p = gh_paths[i]
+                        if not os.path.exists(p):
+                            cv2.imwrite(p, _to_u16(im))
+                    blend_prefix = gh_prefix
+                    _phase_end(f"ghosting/{algo}", t0, timings, coll_dir=coll_dir)
+
+            # Blend all requested modes for this alignment output
+            for blend_type in mode_list:
+                out_name = f"{blend_type}_{algo}_{base_name}.tiff"
+                final_out_path = os.path.join(coll_dir, out_name)
+                if os.path.exists(final_out_path):
+                    tlog(f"{os.path.basename(coll_dir)}: final exists, skip {out_name}")
+                    print(f"[{os.path.basename(coll_dir)}] (skip) -> {out_name}")
+                    continue
+
+                t0 = _phase_start(f"blend/{blend_type}/{algo}", coll_dir=coll_dir)
+                tmp_out_path = os.path.join(tmpdir, out_name)
+
+                if blend_type == "mean":
+                    paths = _paths_in_tmpdir(tmpdir, blend_prefix)
+                    out_float = _rolling_mean_blend(paths, device=device)
+                    out_16 = float_to_16bit_tiff(out_float)
+                    cv2.imwrite(tmp_out_path, out_16)
+                elif blend_type in ("min", "median", "max"):
+                    stack_imgs = _read_images_from_tmpdir(tmpdir, blend_prefix)
+                    out_float = _stack_blend(stack_imgs, kind=blend_type, device=device)
+                    out_16 = float_to_16bit_tiff(out_float)
+                    cv2.imwrite(tmp_out_path, out_16)
+                elif blend_type == "hdr":
+                    stack_imgs = _read_images_from_tmpdir(tmpdir, blend_prefix)
+                    paths = []
+                    for i, im in enumerate(stack_imgs):
+                        p = os.path.join(tmpdir, f"enfuse_hdr_{algo}_{i:04d}.tif")
+                        if not os.path.exists(p):
+                            cv2.imwrite(p, _to_u16(im))
+                        paths.append(p)
+                    run_enfuse_hdr(paths, tmp_out_path)
+                elif blend_type == "focus":
+                    stack_imgs = _read_images_from_tmpdir(tmpdir, blend_prefix)
+                    paths = []
+                    for i, im in enumerate(stack_imgs):
+                        p = os.path.join(tmpdir, f"enfuse_focus_{algo}_{i:04d}.tif")
+                        if not os.path.exists(p):
+                            cv2.imwrite(p, _to_u16(im))
+                        paths.append(p)
+                    run_enfuse_focus(paths, tmp_out_path)
+
+                _phase_end(f"blend/{blend_type}/{algo}", t0, timings, coll_dir=coll_dir)
+
+                _copy_exif_from_base(base_path, tmp_out_path)
+                shutil.copy2(tmp_out_path, final_out_path)
+                tlog(f"{os.path.basename(coll_dir)}: wrote {out_name}")
+                print(f"[{os.path.basename(coll_dir)}] -> {out_name}")
     finally:
         # Clean up temporary directory for this collection unless --keep was requested
         if keep_tmp:
@@ -737,12 +770,12 @@ def main():
     ap.add_argument("--model", type=str, default=None,
                     help="Path to super-resolve model; used only when scale is 2")
     ap.add_argument("--align", type=str, default="akaze,ecc",
-                    help="Alignment methods to try, comma-separated (e.g. akaze,ecc)")
+                    help="Alignment methods to run, comma-separated (e.g. akaze,ecc). All specified methods are executed.")
     ap.add_argument("--ghosting", type=int, default=1, choices=[0, 1],
                     help="Enable(1)/disable(0) ghosting detection/correction after alignment (default 1)")
-    ap.add_argument("--mode", type=str, default=None, dest="mode_override",
-                    choices=["mean", "hdr", "focus", "min", "median", "max"],
-                    help="Override blend mode (otherwise inferred from directory name)")
+    ap.add_argument("--mode", type=str, action="append", default=None, dest="mode_override",
+                    help="Blend mode(s) to run. May be repeated and/or comma-separated (e.g. --mode mean --mode hdr or --mode mean,hdr). "
+                         "If omitted, mode is inferred from directory name.")
     ap.add_argument("--threads", type=int, default=3,
                     help="Number of threads for the upscaling phase (default 3)")
     ap.add_argument("--keep", action="store_true",
@@ -750,7 +783,15 @@ def main():
     args = ap.parse_args()
 
     scale_x, scale_y = parse_scale(args.scale)
-    align_order = [a.strip().lower() for a in args.align.split(",") if a.strip()]
+    align_list = _parse_csv_list(args.align)
+    mode_list = _parse_csv_list(args.mode_override)
+    # Validate
+    bad_align = [a for a in align_list if a not in _VALID_ALIGNS]
+    if bad_align:
+        raise SystemExit(f"Invalid --align value(s): {bad_align}. Valid: {sorted(_VALID_ALIGNS)}")
+    bad_mode = [m for m in mode_list if m not in _VALID_MODES]
+    if bad_mode:
+        raise SystemExit(f"Invalid --mode value(s): {bad_mode}. Valid: {sorted(_VALID_MODES)}")
     device = get_device()
     print(f"Using device: {device}", file=sys.stderr)
     timings = {}
@@ -760,8 +801,8 @@ def main():
         coll_dirs = sorted(glob.glob("coll-*"))
     for d in coll_dirs:
         if os.path.isdir(d):
-            process_coll_dir(d, scale_x, scale_y, args.model, align_order, args.ghosting == 1,
-                             args.mode_override, script_dir, device, args.threads, args.keep, timings)
+            process_coll_dir(d, scale_x, scale_y, args.model, align_list, args.ghosting == 1,
+                             mode_list, script_dir, device, args.threads, args.keep, timings)
     _phase_end("script", t0_all, timings, coll_dir=None)
     # Summary
     tlog("phase timing summary:")
