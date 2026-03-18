@@ -27,7 +27,35 @@ def parse_args():
         nargs="+",
         help="Input images (TIFFs or other formats readable by OpenCV). Use shell globs like *.tif.",
     )
+    p.add_argument(
+        "--raw-range",
+        action="store_true",
+        help="Do NOT normalize inputs; average in the raw input numeric range (e.g. 0..65535). "
+             "Most viewers will display float TIFFs correctly only when values are in 0..1.",
+    )
     return p.parse_args()
+
+
+def _to_float01(img: np.ndarray) -> np.ndarray:
+    """Convert uint8/uint16/float to float32 in [0,1] (best-effort)."""
+    if img.dtype == np.uint8:
+        return (img.astype(np.float32) / 255.0).clip(0.0, 1.0)
+    if img.dtype == np.uint16:
+        return (img.astype(np.float32) / 65535.0).clip(0.0, 1.0)
+    if np.issubdtype(img.dtype, np.floating):
+        x = img.astype(np.float32)
+        # If it already looks normalized, keep it. Otherwise, scale by max of the frame.
+        mx = float(np.nanmax(x)) if x.size else 0.0
+        if mx <= 1.5:
+            return np.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0).clip(0.0, 1.0)
+        if mx > 0:
+            return np.nan_to_num(x / mx, nan=0.0, posinf=1.0, neginf=0.0).clip(0.0, 1.0)
+        return np.zeros_like(x, dtype=np.float32)
+    # Fallback: interpret as integer-like and scale by dtype max if available
+    info = np.iinfo(img.dtype) if np.issubdtype(img.dtype, np.integer) else None
+    if info and info.max > 0:
+        return (img.astype(np.float32) / float(info.max)).clip(0.0, 1.0)
+    return img.astype(np.float32)
 
 
 def main():
@@ -53,7 +81,7 @@ def main():
             print(f"Warning: shape mismatch for {path} (got {img.shape}, expected {shape}), skipping.", file=sys.stderr)
             continue
 
-        img_f = img.astype(np.float32)
+        img_f = img.astype(np.float32) if args.raw_range else _to_float01(img)
 
         if running is None:
             running = img_f.copy()
