@@ -563,6 +563,13 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
     blend_type = mode_override if mode_override else detect_blend_type(coll_dir)
     align_used = align_order[0] if align_order else "none"
 
+    out_name = f"{blend_type}_{align_used}_{base_name}.tiff"
+    final_out_path = os.path.join(coll_dir, out_name)
+    if os.path.exists(final_out_path):
+        tlog(f"{os.path.basename(coll_dir)}: final exists, skip {out_name}")
+        print(f"[{os.path.basename(coll_dir)}] (skip) -> {out_name}")
+        return
+
     tmpdir = _tmpdir_for_base(base_name)
     os.makedirs(tmpdir, exist_ok=True)
 
@@ -572,6 +579,9 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
     use_super_resolve = scale_is_two and model_path and os.path.isfile(model_path)
 
     def _upscale_one(idx, path):
+        up_path = os.path.join(tmpdir, f"up_{idx:04d}.tif")
+        if os.path.exists(up_path):
+            return
         img = load_image(path)
         if img is None:
             tlog(f"{os.path.basename(coll_dir)}: warning: could not read {os.path.basename(path)}")
@@ -582,19 +592,19 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
             # its output back to 16-bit for all downstream processing.
             tmp_in = os.path.join(tmpdir, f"_sr_in_{idx:04d}.tif")
             tmp_out = os.path.join(tmpdir, f"_sr_out_{idx:04d}.tif")
-            cv2.imwrite(tmp_in, img)
-            run_super_resolve(tmp_in, tmp_out, model_path, script_dir)
+            if not os.path.exists(tmp_out):
+                if not os.path.exists(tmp_in):
+                    cv2.imwrite(tmp_in, img)
+                run_super_resolve(tmp_in, tmp_out, model_path, script_dir)
             up = load_image(tmp_out)
             if up is not None:
                 if up.dtype == np.uint8:
                     up = (up.astype(np.uint16) * 257)  # 0-255 -> full 0-65535 ladder
-                up_path = os.path.join(tmpdir, f"up_{idx:04d}.tif")
                 cv2.imwrite(up_path, up)
         else:
             up = upscale_lanczos(img, scale_x, scale_y)
             if up.dtype == np.uint8:
                 up = (up.astype(np.uint16) * 257)
-            up_path = os.path.join(tmpdir, f"up_{idx:04d}.tif")
             cv2.imwrite(up_path, up)
 
     with ThreadPoolExecutor(max_workers=max(1, threads)) as ex:
@@ -604,33 +614,44 @@ def process_coll_dir(coll_dir, scale_x, scale_y, model_path, align_order, ghosti
     images = _read_images_from_tmpdir(tmpdir, "up_")
     if not images:
         print(f"[{os.path.basename(coll_dir)}] No images in tmpdir, skip.")
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        if not keep_tmp:
+            shutil.rmtree(tmpdir, ignore_errors=True)
         return
 
     # Align (all to first); warping uses GPU when available; write aligned to tmpdir
     tlog(f"{os.path.basename(coll_dir)}: start aligning")
-    if len(align_order) > 0:
-        aligned = align_images_simple(images, align_order, ref_index=0, device=device)
+    n_images = len(images)
+    al_paths = [os.path.join(tmpdir, f"al_{i:04d}.tif") for i in range(n_images)]
+    if all(os.path.exists(p) for p in al_paths):
+        aligned = _read_images_from_tmpdir(tmpdir, "al_")
     else:
-        aligned = images
-    for i, im in enumerate(aligned):
-        cv2.imwrite(os.path.join(tmpdir, f"al_{i:04d}.tif"), _to_u16(im))
+        if len(align_order) > 0:
+            aligned = align_images_simple(images, align_order, ref_index=0, device=device)
+        else:
+            aligned = images
+        for i, im in enumerate(aligned):
+            p = al_paths[i]
+            if not os.path.exists(p):
+                cv2.imwrite(p, _to_u16(im))
+        aligned = _read_images_from_tmpdir(tmpdir, "al_")
 
     # Ghosting correction (separate step after alignment; read/write tmpdir)
     if ghosting and len(aligned) > 1:
         tlog(f"{os.path.basename(coll_dir)}: start ghosting")
-        aligned = correct_ghosting(aligned, device=device)
-        for i, im in enumerate(aligned):
-            cv2.imwrite(os.path.join(tmpdir, f"gh_{i:04d}.tif"), _to_u16(im))
+        gh_paths = [os.path.join(tmpdir, f"gh_{i:04d}.tif") for i in range(len(aligned))]
+        if not all(os.path.exists(p) for p in gh_paths):
+            deghosted = correct_ghosting(aligned, device=device)
+            for i, im in enumerate(deghosted):
+                p = gh_paths[i]
+                if not os.path.exists(p):
+                    cv2.imwrite(p, _to_u16(im))
         blend_prefix = "gh_"
     else:
         blend_prefix = "al_"
 
     # Blend (uses GPU when available); final output first goes to tmpdir, then is copied to coll_dir
     tlog(f"{os.path.basename(coll_dir)}: start blending")
-    out_name = f"{blend_type}_{align_used}_{base_name}.tiff"
     tmp_out_path = os.path.join(tmpdir, out_name)
-    final_out_path = os.path.join(coll_dir, out_name)
 
     if blend_type == "mean":
         # Rolling average: stream one image at a time; only two in memory (current + running mean)
