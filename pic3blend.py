@@ -435,57 +435,96 @@ def correct_ghosting(images, variance_percentile=95.0, device=None):
     """
     Post-alignment ghosting correction: at pixels where variance across the stack
     is high (moving objects / misalignment), replace values with the median.
-    Uses GPU when device is cuda/mps. Returns list of images (same order).
+    Tiled implementation to avoid OOM on large images.
     """
     if device is None:
         device = get_device()
     use_gpu = device.type in ("cuda", "mps")
-    if use_gpu:
-        try:
-            # (N, C, H, W) on device, float [0,1]
-            tensors = [_numpy_to_tensor(im, device) for im in images]
-            stack = torch.stack(tensors, dim=0)
-            var = stack.var(dim=0)  # (C, H, W)
-            var_pixel, _ = var.max(dim=0)  # (H, W)
-            q = variance_percentile / 100.0
-            try:
-                thresh = torch.quantile(var_pixel.flatten(), q).item()
-            except Exception:
-                # Fallback to NumPy percentile on CPU if torch.quantile is unsupported
-                thresh = float(np.percentile(var_pixel.cpu().numpy(), variance_percentile))
-            ghost_mask_2d = var_pixel > thresh  # (H, W)
-            ghost_mask = ghost_mask_2d.unsqueeze(0).expand(stack.shape[1], -1, -1)  # (C, H, W)
-            med = stack.median(dim=0).values
-            out = []
-            for i in range(len(images)):
-                img = stack[i].clone()
-                img[ghost_mask] = med[ghost_mask]
-                img = img.clamp(0, 1)
-                dtype = images[i].dtype
-                if dtype == np.uint16:
-                    out.append(_tensor_to_numpy(img, dtype=np.uint16))
-                else:
-                    out.append(_tensor_to_numpy(img, dtype=np.uint8))
-            return out
-        except Exception as e:
-            tlog(f"GPU ghosting failed, falling back to CPU: {e}")
-    # CPU path – preserve original bit depth
+
+    if not images:
+        return images
+
     dtype = images[0].dtype
-    stack = np.stack(images, axis=0).astype(np.float64)
-    var = np.var(stack, axis=0)
-    var_pixel = np.max(var, axis=-1)
-    thresh = np.percentile(var_pixel, variance_percentile)
-    ghost_mask_2d = var_pixel > thresh
-    ghost_mask = np.broadcast_to(ghost_mask_2d[:, :, np.newaxis], stack.shape[1:])
-    med = np.median(stack, axis=0)
-    out = []
-    maxv = 65535.0 if dtype == np.uint16 else 255.0
-    for i in range(len(images)):
-        img = stack[i].copy()
-        img[ghost_mask] = med[ghost_mask]
-        img = np.clip(img, 0.0, maxv)
-        out.append(img.astype(dtype))
-    return out
+    if dtype == np.uint16:
+        div = 65535.0
+        mul = 65535.0
+        out_dtype = np.uint16
+    else:
+        div = 255.0
+        mul = 255.0
+        out_dtype = np.uint8
+
+    H, W = images[0].shape[:2]
+    n = len(images)
+
+    # Tile size controls peak memory. You can tune with GHOST_TILE_PX.
+    tile_px = int(os.environ.get("GHOST_TILE_PX", "512"))
+    tile_px = max(64, tile_px)
+
+    # First pass: compute per-pixel variance across the stack (no big stacks).
+    t0 = _phase_start("ghosting/var_pass", coll_dir=None)
+    var_pixel = np.zeros((H, W), dtype=np.float32)
+    for y in range(0, H, tile_px):
+        th = min(tile_px, H - y)
+        for x in range(0, W, tile_px):
+            tw = min(tile_px, W - x)
+            # (C, th, tw)
+            mean = np.zeros((3, th, tw), dtype=np.float32)
+            m2 = np.zeros_like(mean)
+            for i in range(n):
+                tile = images[i][y:y + th, x:x + tw]
+                tile_f = tile.astype(np.float32) / div  # [0,1]
+                tile_chw = tile_f.transpose(2, 0, 1)
+                k = i + 1
+                delta = tile_chw - mean
+                mean += delta / float(k)
+                delta2 = tile_chw - mean
+                m2 += delta * delta2
+            var = m2 / float(n - 1) if n > 1 else np.zeros_like(mean)
+            var_pixel[y:y + th, x:x + tw] = var.max(axis=0)
+    _phase_end("ghosting/var_pass", t0, timings={}, coll_dir=None)
+
+    thresh = float(np.percentile(var_pixel, variance_percentile))
+    # Second pass: compute median per tile, then replace ghost pixels in-place.
+    for y in range(0, H, tile_px):
+        th = min(tile_px, H - y)
+        for x in range(0, W, tile_px):
+            tw = min(tile_px, W - x)
+            ghost_mask_2d = var_pixel[y:y + th, x:x + tw] > thresh
+            if not ghost_mask_2d.any():
+                continue
+
+            if use_gpu:
+                tensors = []
+                for i in range(n):
+                    tile = images[i][y:y + th, x:x + tw]
+                    tile_f = tile.astype(np.float32) / div
+                    t = torch.from_numpy(tile_f).permute(2, 0, 1).to(device=device)
+                    tensors.append(t)
+                stack = torch.stack(tensors, dim=0)  # (N,C,th,tw)
+                med = stack.median(dim=0).values  # (C,th,tw)
+                m3 = torch.from_numpy(ghost_mask_2d).to(device=device).unsqueeze(0).expand(3, -1, -1)
+                for i in range(n):
+                    replaced = torch.where(m3, med, tensors[i]).clamp(0.0, 1.0)
+                    tile_out = replaced.permute(1, 2, 0).cpu().numpy()  # HWC float [0,1]
+                    images[i][y:y + th, x:x + tw] = (tile_out * mul + 0.5).astype(out_dtype)
+                del tensors, stack, med, m3
+            else:
+                stack_np = np.empty((n, 3, th, tw), dtype=np.float32)
+                for i in range(n):
+                    tile = images[i][y:y + th, x:x + tw]
+                    tile_f = tile.astype(np.float32) / div
+                    stack_np[i] = tile_f.transpose(2, 0, 1)
+                med = np.median(stack_np, axis=0)  # (C,th,tw)
+                m3 = np.broadcast_to(ghost_mask_2d[np.newaxis, :, :], (3, th, tw))
+                for i in range(n):
+                    tile_chw = stack_np[i]
+                    replaced = np.where(m3, med, tile_chw)
+                    tile_out = replaced.transpose(1, 2, 0)  # HWC float
+                    images[i][y:y + th, x:x + tw] = (tile_out * mul + 0.5).astype(out_dtype)
+                del stack_np, med
+
+    return images
 
 
 def _rolling_mean_blend(paths, device=None):
