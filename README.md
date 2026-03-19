@@ -12,6 +12,14 @@ Single-image super-resolution via a small U‑net that learns to clean up Lanczo
 
 ### 2. **pic3blend**
 Batch pipeline for “coll-*” folders: upscale (or 2× super-resolve), align, optional ghost fixing, then blend—mean, HDR, focus stack, or min/median/max—into one 16‑bit TIFF. Handy when your source dir is on a network mount and you want one command per stack.
+
+The name arose from back in the days of using `zsh` functions for much of my photo-processing, I tried to name them in a roughly increasing order of application:
+* `pic.1.*` were for offloading images and reorganizing, eg into directories by file extension or by number-of-images (still useful for when you have a load of stacks all of 3 or 5 frames each)
+* `pic.2.*` were for RAW conversion with dcraw, rawtherapee etc
+* `pic.3.*` were for blending HDR, focus-stacks etc
+* `pic.4.*` were for forcing XMP metadata into the archival JPEGs and producing downsized versions (2k, 4k)
+* `pic.5.*` were for tidying up the directory and moving it to the rsync backup server
+
 → See [PIC3BLEND.md](PIC3BLEND.md).
 
 ### 3. **Timelapse interpolator**
