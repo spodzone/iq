@@ -273,7 +273,8 @@ def run_super_resolve(input_path, output_path, model_path, script_dir):
 
 def _warp_perspective_gpu(img_tensor, H, out_h, out_w, device):
     """img_tensor: (C,H,W). H: 3x3 numpy (src->dst). Warp so dst is (out_h, out_w)."""
-    H_inv = np.linalg.inv(H).astype(np.float32)
+    H = np.asarray(H, dtype=np.float32)
+    H_inv = np.linalg.inv(H).astype(np.float32, copy=False)
     h_src, w_src = img_tensor.shape[1], img_tensor.shape[2]
     # Build grid: for each (y,x) in output we need source (x_s, y_s) in pixel coords then normalize to [-1,1]
     yy = np.arange(out_h, dtype=np.float32)
@@ -288,9 +289,9 @@ def _warp_perspective_gpu(img_tensor, H, out_h, out_w, device):
     # to normalized coords for grid_sample: [-1, 1]
     x_n = 2.0 * x_s / (w_src - 1) - 1.0
     y_n = 2.0 * y_s / (h_src - 1) - 1.0
-    grid = np.stack([x_n, y_n], axis=-1)  # (H, W, 2)
-    grid_t = torch.from_numpy(grid).to(device=device).unsqueeze(0)  # (1, H, W, 2)
-    img_batch = img_tensor.unsqueeze(0)  # (1, C, H, W)
+    grid = np.stack([x_n, y_n], axis=-1).astype(np.float32, copy=False)  # (H, W, 2)
+    grid_t = torch.from_numpy(grid).to(device=device, dtype=torch.float32).unsqueeze(0)
+    img_batch = img_tensor.unsqueeze(0).float()  # grid_sample needs float grid + float input
     out = F.grid_sample(img_batch, grid_t, mode="bilinear", padding_mode="reflection", align_corners=True)
     return out.squeeze(0)
 
@@ -298,8 +299,9 @@ def _warp_perspective_gpu(img_tensor, H, out_h, out_w, device):
 def _warp_affine_gpu(img_tensor, M_2x3, out_h, out_w, device):
     """img_tensor: (C,H,W). M_2x3: affine (src->dst)."""
     # M maps [x_src, y_src, 1] -> [x_dst, y_dst]. We need for each dst (x,y) the src (x',y').
-    M = np.vstack([M_2x3.astype(np.float32), [0, 0, 1]])
-    M_inv = np.linalg.inv(M)
+    M_2x3 = np.asarray(M_2x3, dtype=np.float32)
+    M = np.vstack([M_2x3, np.array([[0.0, 0.0, 1.0]], dtype=np.float32)])
+    M_inv = np.linalg.inv(M).astype(np.float32, copy=False)
     M_inv_2x3 = M_inv[:2, :]  # (2, 3)
     yy = np.arange(out_h, dtype=np.float32)
     xx = np.arange(out_w, dtype=np.float32)
@@ -312,9 +314,9 @@ def _warp_affine_gpu(img_tensor, M_2x3, out_h, out_w, device):
     h_src, w_src = img_tensor.shape[1], img_tensor.shape[2]
     x_n = 2.0 * x_s / (w_src - 1) - 1.0
     y_n = 2.0 * y_s / (h_src - 1) - 1.0
-    grid = np.stack([x_n, y_n], axis=-1)
-    grid_t = torch.from_numpy(grid).to(device=device).unsqueeze(0)
-    img_batch = img_tensor.unsqueeze(0)
+    grid = np.stack([x_n, y_n], axis=-1).astype(np.float32, copy=False)
+    grid_t = torch.from_numpy(grid).to(device=device, dtype=torch.float32).unsqueeze(0)
+    img_batch = img_tensor.unsqueeze(0).float()
     out = F.grid_sample(img_batch, grid_t, mode="bilinear", padding_mode="reflection", align_corners=True)
     return out.squeeze(0)
 
@@ -350,6 +352,7 @@ def align_akaze(ref_img, to_align_img):
     H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
     if H is None:
         return None, None, None
+    H = np.asarray(H, dtype=np.float32)
     h, w = ref_img.shape[:2]
     aligned = cv2.warpPerspective(to_align_img, H, (w, h))
     return aligned, "homography", H
@@ -367,6 +370,7 @@ def align_ecc(ref_img, to_align_img, number_of_iterations=5000, termination_eps=
                                                number_of_iterations, termination_eps))
     except Exception:
         return None, None, None
+    M = np.asarray(M, dtype=np.float32)
     aligned = cv2.warpAffine(to_align_img, M, (w, h),
                              flags=cv2.INTER_LANCZOS4,
                              borderMode=cv2.BORDER_REFLECT_101)
