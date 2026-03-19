@@ -124,7 +124,8 @@ def _parse_csv_list(values):
 def image_files_in_dir(d):
     """Return sorted list of source image file paths in directory d.
 
-    Only keep photo-like inputs: extensions in IMAGE_EXT and basenames starting with `DSC` or `IMG`.
+    Only keep photo-like inputs: extensions in IMAGE_EXT and basenames starting with
+    `DSC`, `IMG`, or `DJI`.
     This intentionally excludes previous-run output TIFFs (which also use .tif/.tiff extensions).
     """
     names = []
@@ -136,7 +137,7 @@ def image_files_in_dir(d):
         if ext not in IMAGE_EXT:
             continue
         f_upper = f.upper()
-        if not (f_upper.startswith("DSC") or f_upper.startswith("IMG")):
+        if not (f_upper.startswith("DSC") or f_upper.startswith("IMG") or f_upper.startswith("DJI")):
             continue
         names.append(f)
     return sorted([os.path.join(d, n) for n in names])
